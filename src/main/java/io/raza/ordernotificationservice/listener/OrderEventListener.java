@@ -22,7 +22,13 @@ public class OrderEventListener {
                         + " | offset=" + record.offset()
                         + " | orderId=" + event.orderId()
                         + " | customerId=" + event.customerId()
+                        + " | productId=" + event.productId()
         );
+
+        if (event.productId().equals(9999L)) {
+            System.out.println("Simulating notification failure...");
+            throw new RuntimeException("Notification service failed");
+        }
 
         System.out.println(
                 "Notification: Order "
