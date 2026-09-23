@@ -1,5 +1,6 @@
 package io.raza.ordernotificationservice.config;
 
+import io.raza.ordernotificationservice.exception.InvalidOrderEventException;
 import org.apache.kafka.common.TopicPartition;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -29,9 +30,16 @@ public class KafkaErrorHandlerConfig {
     public DefaultErrorHandler kafkaErrorHandler(
             DeadLetterPublishingRecoverer recoverer) {
 
-        return new DefaultErrorHandler(
-                recoverer,
-                new FixedBackOff(1000L, 2L)
+        DefaultErrorHandler errorHandler =
+                new DefaultErrorHandler(
+                        recoverer,
+                        new FixedBackOff(1000L, 2L)
+                );
+
+        errorHandler.addNotRetryableExceptions(
+                InvalidOrderEventException.class
         );
+
+        return errorHandler;
     }
 }

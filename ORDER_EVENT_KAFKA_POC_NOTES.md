@@ -1423,42 +1423,159 @@ docker exec -it kafka-poc \
 
 ---
 
-# 29. Planned Learning Roadmap
+# 29. Duplicate Delivery & Offset Replay Experiment
 
-After DLT, continue roughly in this order:
+**Status: DONE**
+
+We simulated duplicate event delivery by resetting the consumer group's committed offset backward on the broker, demonstrating why Kafka's at-least-once delivery guarantees mandate idempotent business consumers.
+
+### Experiment Procedure & Observations
+
+1. **Initial Baseline Processing**:
+   - Produced a normal order (`orderId = 12`).
+   - Notification service consumed the event:
+     ```text
+     Received event | key=12 | partition=0 | offset=9 | orderId=12
+     Notification: Order 12 placed successfully!
+     ```
+   - Partition position committed to offset `10`.
+
+2. **Consumer Shutdown & State Inspection**:
+   - Stopped `order-notification-service`.
+   - Verified consumer group status:
+     ```bash
+     docker exec -it kafka-poc \
+       /opt/kafka/bin/kafka-consumer-groups.sh \
+       --bootstrap-server localhost:9092 \
+       --describe \
+       --group order-notification-group
+     ```
+     Output:
+     ```text
+     GROUP                    TOPIC        PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID  HOST  CLIENT-ID
+     order-notification-group order-events 0          10              10              0    -            -     -
+     ```
+     `CURRENT-OFFSET = 10` confirms that offset `9` was processed and committed, and the next read position is `10`.
+
+3. **Intentionally Shifting Offset Backward**:
+   - Executed offset reset with `--shift-by -1`:
+     ```bash
+     docker exec -it kafka-poc \
+       /opt/kafka/bin/kafka-consumer-groups.sh \
+       --bootstrap-server localhost:9092 \
+       --group order-notification-group \
+       --topic order-events:0 \
+       --reset-offsets \
+       --shift-by -1 \
+       --execute
+     ```
+     Result:
+     ```text
+     GROUP                     TOPIC          PARTITION   NEW-OFFSET
+     order-notification-group  order-events   0           9
+     ```
+     Kafka now views offset `9` as unconsumed for `order-notification-group`.
+
+4. **Service Restart & Duplicate Execution**:
+   - Restarted `order-notification-service`.
+   - Consumer resumed from the newly reset offset `9`:
+     ```text
+     Received event | key=12 | partition=0 | offset=9 | orderId=12
+     Notification: Order 12 placed successfully!
+     ```
+   - Result: The exact same business event produced a duplicate notification.
+
+---
+
+### Core Learning & Mental Model
+
+```text
+First processing:
+Offset 9 (Order 12) ----> Processed ----> Send Notification ✅ ----> Commit offset 10
+
+Offset Reset (--shift-by -1):
+Committed position moved 10 -> 9
+
+Consumer Restart:
+Offset 9 (Order 12) ----> Delivered again ----> Send Notification AGAIN ❌ (Duplicate side-effect)
+```
+
+1. **Kafka Replay vs. New Record**:
+   - Kafka did not create a new event. The record at `partition=0, offset=9` was simply re-read.
+   - Offsets are immutable; consumer group progress is just a pointer (`committed offset`) stored in Kafka's internal `__consumer_offsets` topic.
+2. **At-Least-Once Delivery**:
+   - In real-world systems, duplicate deliveries occur regularly due to network timeouts during offset commit, consumer restarts/crashes before commit, rebalances, or administrative re-processing.
+   - At-least-once delivery + non-idempotent consumer = duplicate side effects (duplicate emails, double billing, duplicate notifications).
+
+---
+
+### Planned Idempotency Evolution
+
+```text
+Order event arrives
+       |
+       v
+Have I already processed OrderPlaced for this orderId?
+       |
+   +---+---+
+   |       |
+  NO      YES
+   |       |
+   v       v
+Process & Send    Ignore Duplicate
+Notification
+```
+
+#### Step 1: Naive In-Memory Deduplication (Upcoming Experiment)
+- Implement `ConcurrentHashMap.newKeySet()` (`Set<Long> processedOrders`).
+- Intended Flaws to Observe:
+  1. **JVM Restart Loss**: On service restart, the in-memory set resets; replayed events will be reprocessed.
+  2. **Multi-Instance Isolation**: Multiple instances have independent memory sets; cannot coordinate duplicate suppression across instances.
+
+#### Step 2: Persistent Deduplication Store (Production Pattern)
+- A persistent database table (`processed_events` or `idempotency_keys`) with a `UNIQUE` constraint on `order_id` / `event_id`.
+- Ensures atomic, durable, multi-instance deduplication.
+
+---
+
+# 30. Planned Learning Roadmap
+
+After DLT and Duplicate Delivery, continue roughly in this order:
 
 ```text
 1. Explicit retry configuration              ✅
 2. Dead Letter Topic (DLT)                   ✅
-3. Retryable vs non-retryable exceptions     ⏳ next
-4. Idempotent consumer                       ⏳ upcoming
-5. Duplicate event simulation                ⏳ upcoming
-6. Manual / different acknowledgement modes
-7. Multiple partitions
-8. Multiple instances of notification service
-9. Consumer group load balancing
-10. Consumer rebalance
-11. Kafka key and ordering
-12. Multiple brokers
-13. Replication factor
-14. Leader / follower failover
-15. Producer acknowledgements (acks)
-16. Idempotent producer
-17. Kafka delivery semantics
-18. PostgreSQL + Kafka failure window
-19. Transactional Outbox
-20. Outbox publisher
-21. Eventual consistency
-22. OpenSearch read model
-23. Redis where useful
-24. Observability / correlation ID
-25. Docker Compose
-26. Kubernetes deployment
+3. Duplicate delivery via offset reset       ✅
+4. In-memory idempotent consumer (naive)     ⏳ next
+5. Breaking in-memory idempotency            ⏳ upcoming
+6. Persistent idempotency (DB table)         ⏳ upcoming
+7. Retryable vs non-retryable exceptions
+8. Manual / different acknowledgement modes
+9. Multiple partitions
+10. Multiple instances of notification service
+11. Consumer group load balancing
+12. Consumer rebalance
+13. Kafka key and ordering
+14. Multiple brokers
+15. Replication factor
+16. Leader / follower failover
+17. Producer acknowledgements (acks)
+18. Idempotent producer
+19. Kafka delivery semantics
+20. PostgreSQL + Kafka failure window
+21. Transactional Outbox
+22. Outbox publisher
+23. Eventual consistency
+24. OpenSearch read model
+25. Redis where useful
+26. Observability / correlation ID
+27. Docker Compose
+28. Kubernetes deployment
 ```
 
 ---
 
-# 30. Multi-Partition Experiment Planned
+# 31. Multi-Partition Experiment Planned
 
 Later change:
 
@@ -1496,7 +1613,7 @@ We will test:
 
 ---
 
-# 31. Multi-Consumer Experiment Planned
+# 32. Multi-Consumer Experiment Planned
 
 With 3 partitions:
 
@@ -1533,7 +1650,7 @@ Stop one consumer and observe the rebalance.
 
 ---
 
-# 32. Multi-Broker Experiment Planned
+# 33. Multi-Broker Experiment Planned
 
 Later run multiple Kafka brokers.
 
@@ -1575,7 +1692,7 @@ practical rather than theoretical.
 
 ---
 
-# 33. OpenSearch Plan
+# 34. OpenSearch Plan
 
 PostgreSQL will remain the source of truth.
 
@@ -1614,7 +1731,7 @@ This will introduce:
 
 ---
 
-# 34. Core Mental Models So Far
+# 35. Core Mental Models So Far
 
 ## Broker
 
@@ -1700,21 +1817,27 @@ routes unrecoverable / retry-exhausted messages to a Dead Letter Topic (DLT)
 side topic holding failed messages with diagnostic headers to avoid poison-pill consumer blocking
 ```
 
+## Offset Reset / Replay
+
+```text
+administratively shifting a consumer group's committed offset backward to reprocess earlier records
+```
+
 ## At-least-once implication
 
 ```text
-the same Kafka record may be processed more than once
+the same Kafka record may be processed more than once due to retries, crashes, or rebalances
 ```
 
-Therefore:
+## Idempotent Consumer
 
 ```text
-consumer business logic should eventually become idempotent
+consumer business logic designed to produce the same outcome regardless of how many times a message is delivered
 ```
 
 ---
 
-# 35. Commands Used Frequently
+# 36. Commands Used Frequently
 
 Check Kafka container:
 
@@ -1794,6 +1917,19 @@ docker exec -it kafka-poc \
   --group order-notification-group
 ```
 
+Reset consumer group offset (shift backward by 1 record):
+
+```bash
+docker exec -it kafka-poc \
+  /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group order-notification-group \
+  --topic order-events:0 \
+  --reset-offsets \
+  --shift-by -1 \
+  --execute
+```
+
 Check Colima:
 
 ```bash
@@ -1814,7 +1950,7 @@ colima stop
 
 ---
 
-# 36. Current Checkpoint
+# 37. Current Checkpoint
 
 At this checkpoint:
 
@@ -1833,9 +1969,11 @@ Offline consumer recovery          ✅
 Failure simulation                 ✅
 Same-offset retries observed       ✅
 Dead Letter Topic (DLT)            ✅
+Duplicate Delivery (Offset Reset)  ✅
 
-Retryable vs Non-retryable Errors  ⏳ next
-Idempotent Consumer                ⏳ upcoming
+In-Memory Idempotency (Naive)      ⏳ next
+Persistent Idempotency (DB Table)  ⏳ upcoming
+Retryable vs Non-retryable Errors  ⏳ upcoming
 Multiple partitions                ⏳ later
 Multiple consumers                 ⏳ later
 Multiple brokers                   ⏳ later
