@@ -2,6 +2,8 @@ package io.raza.ordernotificationservice.listener;
 
 
 import io.raza.ordernotificationservice.event.OrderPlacedEvent;
+import io.raza.ordernotificationservice.exception.InvalidOrderEventException;
+import io.raza.ordernotificationservice.exception.NotificationTemporaryException;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
@@ -26,8 +28,19 @@ public class OrderEventListener {
         );
 
         if (event.productId().equals(9999L)) {
-            System.out.println("Simulating notification failure...");
-            throw new RuntimeException("Notification service failed");
+            System.out.println("Simulating TEMPORARY notification failure...");
+
+            throw new NotificationTemporaryException(
+                    "Notification provider temporarily unavailable"
+            );
+        }
+
+        if (event.productId().equals(8888L)) {
+            System.out.println("Simulating INVALID event...");
+
+            throw new InvalidOrderEventException(
+                    "Invalid order event"
+            );
         }
 
         System.out.println(
