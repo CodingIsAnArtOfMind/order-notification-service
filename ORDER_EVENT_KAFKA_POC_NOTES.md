@@ -1288,38 +1288,138 @@ original topic, partition, offset, and exception metadata.
 
 ---
 
-# 28. Next Improvement — Dead Letter Topic
+# 28. Dead Letter Topic (DLT) Implementation
 
-**Status: NEXT**
+**Status: DONE**
 
-After understanding the previous experiment, introduce a Dead Letter Topic.
+We introduced a Dead Letter Topic (`order-events.DLT`) and configured Spring Kafka's error handling to prevent poison-pill records from blocking consumer partitions while preserving unprocessable messages for inspection, alerting, or replay.
 
-Target architecture:
+### Target Architecture
 
 ```text
-order-events
+order-events (Main Topic)
       |
       v
 order-notification-service
       |
-      | success
-      +------------------> notification
+      |-- Success -------------------------------------> Notification Sent
       |
-      | retries exhausted
-      v
-order-events.DLT
+      |-- Failure (e.g. productId == 9999)
+             |
+             v
+      DefaultErrorHandler (FixedBackOff: 1000ms interval, 2 retries)
+             |
+             |-- Attempt 1 (Initial): Fails
+             |-- Attempt 2 (Retry 1): Fails (after 1s)
+             |-- Attempt 3 (Retry 2): Fails (after 1s)
+             |
+             v (Retries Exhausted)
+      DeadLetterPublishingRecoverer
+             |
+             v
+      order-events.DLT (Dead Letter Topic)
+             |
+             v
+      Main partition offset commits -> Next messages (e.g. offset 5) continue
 ```
 
-Goals:
+---
 
-- configure explicit retry behavior
-- configure `DeadLetterPublishingRecoverer`
-- configure `DefaultErrorHandler`
-- publish failed records to a DLT
-- inspect the DLT with Kafka console consumer
-- understand DLT headers
-- understand original topic / partition / offset metadata
-- decide whether failed records should be replayed
+### Implementation Details
+
+#### 1. Error Handler Configuration (`KafkaErrorHandlerConfig.java`)
+
+```java
+@Configuration
+public class KafkaErrorHandlerConfig {
+
+    @Bean
+    public DeadLetterPublishingRecoverer deadLetterPublishingRecoverer(
+            KafkaTemplate<Object, Object> kafkaTemplate) {
+
+        return new DeadLetterPublishingRecoverer(
+                kafkaTemplate,
+                (record, exception) ->
+                        new TopicPartition(
+                                record.topic() + ".DLT",
+                                record.partition()
+                        )
+        );
+    }
+
+    @Bean
+    public DefaultErrorHandler kafkaErrorHandler(
+            DeadLetterPublishingRecoverer recoverer) {
+
+        return new DefaultErrorHandler(
+                recoverer,
+                new FixedBackOff(1000L, 2L)
+        );
+    }
+}
+```
+
+- **`DefaultErrorHandler`**: Intercepts listener exceptions and executes retry logic according to `FixedBackOff(1000L, 2L)` (interval: 1000ms, retry count: 2, total deliveries: 3).
+- **`DeadLetterPublishingRecoverer`**: When retries are exhausted, it forwards the failed record to `order-events.DLT` on the matching partition using `KafkaTemplate`.
+
+#### 2. Producer Serializer Configuration (`application.properties`)
+
+Because `DeadLetterPublishingRecoverer` uses a `KafkaTemplate` to publish the failed event to the DLT, the notification service must configure producer serializers:
+
+```properties
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.LongSerializer
+spring.kafka.producer.value-serializer=org.springframework.kafka.support.serializer.JacksonJsonSerializer
+```
+
+---
+
+### Key Observations & Behavior
+
+1. **Retry Cycle**:
+   - For an event with `productId=9999L`, the listener fails with `RuntimeException("Notification service failed")`.
+   - The message is retried 2 times with a 1-second pause between attempts.
+2. **Publishing to DLT**:
+   - Once all retries are exhausted, the record is published to `order-events.DLT`.
+   - The original key (`Long`) and JSON payload are preserved.
+3. **Offset Progression (No Poison Pill)**:
+   - The consumer group's committed offset on `order-events` moves forward past the failed offset.
+   - Subsequent records on the same partition (e.g., offset 5) are processed without disruption.
+4. **DLT Headers Added by Spring Kafka**:
+   Spring Kafka enriches the published dead-letter record with diagnostic headers:
+   - `kafka_dlt-original-topic`: Name of the source topic (`order-events`).
+   - `kafka_dlt-original-partition`: Source partition index.
+   - `kafka_dlt-original-offset`: Source offset of the failed message.
+   - `kafka_dlt-original-timestamp`: Timestamp of the original event.
+   - `kafka_dlt-exception-fqcn`: Fully-qualified class name of the thrown exception (`java.lang.RuntimeException`).
+   - `kafka_dlt-exception-message`: Error message (`Notification service failed`).
+   - `kafka_dlt-exception-stacktrace`: Full exception stacktrace.
+
+---
+
+### Useful Commands to Verify DLT
+
+#### List Topics (Verify `order-events.DLT` exists)
+
+```bash
+docker exec -it kafka-poc \
+  /opt/kafka/bin/kafka-topics.sh \
+  --list \
+  --bootstrap-server localhost:9092
+```
+
+#### Consume from DLT with Headers and Key
+
+```bash
+docker exec -it kafka-poc \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic order-events.DLT \
+  --bootstrap-server localhost:9092 \
+  --property print.key=true \
+  --property print.headers=true \
+  --property key.separator=" -> " \
+  --property key.deserializer=org.apache.kafka.common.serialization.LongDeserializer \
+  --from-beginning
+```
 
 ---
 
@@ -1328,11 +1428,11 @@ Goals:
 After DLT, continue roughly in this order:
 
 ```text
-1. Explicit retry configuration
-2. Dead Letter Topic
-3. Retryable vs non-retryable exceptions
-4. Idempotent consumer
-5. Duplicate event simulation
+1. Explicit retry configuration              ✅
+2. Dead Letter Topic (DLT)                   ✅
+3. Retryable vs non-retryable exceptions     ⏳ next
+4. Idempotent consumer                       ⏳ upcoming
+5. Duplicate event simulation                ⏳ upcoming
 6. Manual / different acknowledgement modes
 7. Multiple partitions
 8. Multiple instances of notification service
@@ -1358,7 +1458,7 @@ After DLT, continue roughly in this order:
 
 ---
 
-# 28. Multi-Partition Experiment Planned
+# 30. Multi-Partition Experiment Planned
 
 Later change:
 
@@ -1396,7 +1496,7 @@ We will test:
 
 ---
 
-# 29. Multi-Consumer Experiment Planned
+# 31. Multi-Consumer Experiment Planned
 
 With 3 partitions:
 
@@ -1433,7 +1533,7 @@ Stop one consumer and observe the rebalance.
 
 ---
 
-# 30. Multi-Broker Experiment Planned
+# 32. Multi-Broker Experiment Planned
 
 Later run multiple Kafka brokers.
 
@@ -1475,7 +1575,7 @@ practical rather than theoretical.
 
 ---
 
-# 31. OpenSearch Plan
+# 33. OpenSearch Plan
 
 PostgreSQL will remain the source of truth.
 
@@ -1514,7 +1614,7 @@ This will introduce:
 
 ---
 
-# 32. Core Mental Models So Far
+# 34. Core Mental Models So Far
 
 ## Broker
 
@@ -1582,6 +1682,24 @@ Java object -> byte[]
 byte[] -> Java object
 ```
 
+## DefaultErrorHandler
+
+```text
+Spring Kafka listener error handler managing retry attempts and backoff
+```
+
+## DeadLetterPublishingRecoverer
+
+```text
+routes unrecoverable / retry-exhausted messages to a Dead Letter Topic (DLT)
+```
+
+## Dead Letter Topic (DLT)
+
+```text
+side topic holding failed messages with diagnostic headers to avoid poison-pill consumer blocking
+```
+
 ## At-least-once implication
 
 ```text
@@ -1596,7 +1714,7 @@ consumer business logic should eventually become idempotent
 
 ---
 
-# 33. Commands Used Frequently
+# 35. Commands Used Frequently
 
 Check Kafka container:
 
@@ -1652,6 +1770,20 @@ docker exec -it kafka-poc \
   --from-beginning
 ```
 
+Console consumer for DLT with headers:
+
+```bash
+docker exec -it kafka-poc \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic order-events.DLT \
+  --bootstrap-server localhost:9092 \
+  --property print.key=true \
+  --property print.headers=true \
+  --property key.separator=" -> " \
+  --property key.deserializer=org.apache.kafka.common.serialization.LongDeserializer \
+  --from-beginning
+```
+
 Describe consumer group:
 
 ```bash
@@ -1682,30 +1814,31 @@ colima stop
 
 ---
 
-# 34. Current Checkpoint
+# 36. Current Checkpoint
 
 At this checkpoint:
 
 ```text
-Producer works                  ✅
-PostgreSQL persistence works    ✅
-Kafka broker works              ✅
-Kafka topic works               ✅
-Long key works                  ✅
-JSON event works                ✅
-Real consumer works             ✅
-Consumer group works            ✅
-Offset observed                 ✅
-Lag observed                    ✅
-Offline consumer recovery       ✅
-Failure simulation              ✅
-Same-offset retries observed    ✅
+Producer works                     ✅
+PostgreSQL persistence works       ✅
+Kafka broker works                 ✅
+Kafka topic works                  ✅
+Long key works                     ✅
+JSON event works                   ✅
+Real consumer works                ✅
+Consumer group works               ✅
+Offset observed                    ✅
+Lag observed                       ✅
+Offline consumer recovery          ✅
+Failure simulation                 ✅
+Same-offset retries observed       ✅
+Dead Letter Topic (DLT)            ✅
 
-DLT                              ⏳ next
-Idempotency                      ⏳ later
-Multiple partitions             ⏳ later
-Multiple consumers              ⏳ later
-Multiple brokers                ⏳ later
-Outbox                           ⏳ later
-OpenSearch                       ⏳ later
+Retryable vs Non-retryable Errors  ⏳ next
+Idempotent Consumer                ⏳ upcoming
+Multiple partitions                ⏳ later
+Multiple consumers                 ⏳ later
+Multiple brokers                   ⏳ later
+Outbox                             ⏳ later
+OpenSearch                         ⏳ later
 ```
