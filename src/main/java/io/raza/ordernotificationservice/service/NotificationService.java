@@ -8,28 +8,27 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
 public class NotificationService {
+    private  static final String ORDER_PLACED = "ORDER_PLACED";
 
     private final ProcessedEventRepository processedEventRepository;
 
-    public boolean isAlreadyProcessed(Long orderId) {
-        return processedEventRepository
-                .existsByOrderIdAndEventType(
-                        orderId,
-                        "ORDER_PLACED"
-                );
+    public boolean isAlreadyProcessed(UUID eventId) {
+        return processedEventRepository.existsByEventId(eventId);
     }
 
     @Transactional
-    public void markAsProcessed(Long orderId) {
+    public void markAsProcessed(OrderPlacedEvent event) {
 
         ProcessedEventEntity entity =
                 ProcessedEventEntity.builder()
-                        .orderId(orderId)
-                        .eventType("ORDER_PLACED")
+                        .eventId(event.eventId())
+                        .orderId(event.orderId())
+                        .eventType(ORDER_PLACED)
                         .processedAt(LocalDateTime.now())
                         .build();
 

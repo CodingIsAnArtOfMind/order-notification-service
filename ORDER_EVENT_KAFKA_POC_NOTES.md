@@ -1325,6 +1325,22 @@ order-notification-service
 
 ---
 
+### DLT Topic Creation
+
+The DLT topic was created on the broker:
+
+```bash
+docker exec -it kafka-poc \
+  /opt/kafka/bin/kafka-topics.sh \
+  --create \
+  --topic order-events.DLT \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 1
+```
+
+---
+
 ### Implementation Details
 
 #### 1. Error Handler Configuration (`KafkaErrorHandlerConfig.java`)
@@ -1364,7 +1380,7 @@ public class KafkaErrorHandlerConfig {
 
 #### 2. Producer Serializer Configuration (`application.properties`)
 
-Because `DeadLetterPublishingRecoverer` uses a `KafkaTemplate` to publish the failed event to the DLT, the notification service must configure producer serializers:
+Because `DeadLetterPublishingRecoverer` uses a `KafkaTemplate` to publish the failed event to the DLT, `order-notification-service` acts as both a **Kafka Consumer** and a **Kafka Producer**. It must configure producer serializers:
 
 ```properties
 spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.LongSerializer
@@ -1375,16 +1391,23 @@ spring.kafka.producer.value-serializer=org.springframework.kafka.support.seriali
 
 ### Key Observations & Behavior
 
-1. **Retry Cycle**:
-   - For an event with `productId=9999L`, the listener fails with `RuntimeException("Notification service failed")`.
-   - The message is retried 2 times with a 1-second pause between attempts.
-2. **Publishing to DLT**:
+1. **Explicit Retry Math (1 Initial + 2 Retries = 3 Total Attempts)**:
+   - Config: `new FixedBackOff(1000L, 2L)`
+   - 2 retries $\neq$ 2 total attempts. It means:
+     ```text
+     Initial attempt (fails) -> wait 1s -> Retry 1 (fails) -> wait 1s -> Retry 2 (fails) -> Forward to DLT
+     ```
+   - For an event with `productId=9999L`, the listener receives the SAME Kafka record (same partition, same offset, same key) across all 3 attempts.
+2. **Publishing to DLT via `DeadLetterPublishingRecoverer`**:
    - Once all retries are exhausted, the record is published to `order-events.DLT`.
-   - The original key (`Long`) and JSON payload are preserved.
-3. **Offset Progression (No Poison Pill)**:
+   - The original key (`Long`) and JSON payload are preserved on partition 0.
+3. **Producer Idempotence Log Observation**:
+   - Spring Boot logs show: `Instantiated an idempotent producer` (`enable.idempotence = true`).
+   - **Crucial Distinction**: Kafka producer idempotence protects against duplicate writes caused by producer-to-broker retries. It does **NOT** make downstream consumer processing or business workflows exactly-once.
+4. **Offset Progression (No Poison Pill)**:
    - The consumer group's committed offset on `order-events` moves forward past the failed offset.
    - Subsequent records on the same partition (e.g., offset 5) are processed without disruption.
-4. **DLT Headers Added by Spring Kafka**:
+5. **DLT Headers Added by Spring Kafka**:
    Spring Kafka enriches the published dead-letter record with diagnostic headers:
    - `kafka_dlt-original-topic`: Name of the source topic (`order-events`).
    - `kafka_dlt-original-partition`: Source partition index.
@@ -1538,44 +1561,426 @@ Notification
 
 ---
 
-# 30. Planned Learning Roadmap
+# 30. Naive In-Memory Idempotency Experiment & Flaws
 
-After DLT and Duplicate Delivery, continue roughly in this order:
+**Status: DONE**
+
+We tested an in-memory deduplication approach using `ConcurrentHashMap.newKeySet()` (`Set<Long> processedOrders`).
+
+### Implementation (Naive)
+
+```java
+private final Set<Long> processedOrders = ConcurrentHashMap.newKeySet();
+
+if (!processedOrders.add(event.orderId())) {
+    System.out.println("Duplicate event ignored for orderId=" + event.orderId());
+    return;
+}
+```
+
+### Observed Flaws
+
+1. **JVM Restart / Crash Loss**:
+   - When the service restarts, heap memory is wiped clean.
+   - If an offset is replayed or re-delivered after a restart, the event is re-processed, and duplicate side effects occur again.
+2. **Multi-Instance Isolation**:
+   - Each running instance of `order-notification-service` maintains its own isolated JVM heap memory.
+   - When scaling horizontally across multiple pods/containers, instance A cannot see what instance B processed, leading to duplicate side effects.
+
+---
+
+# 31. Persistent Idempotency Implementation (PostgreSQL Table)
+
+**Status: DONE**
+
+To solve the limitations of in-memory tracking, we introduced a durable database table (`processed_events`) in PostgreSQL with a unique constraint.
+
+### Target Architecture
 
 ```text
-1. Explicit retry configuration              ✅
-2. Dead Letter Topic (DLT)                   ✅
-3. Duplicate delivery via offset reset       ✅
-4. In-memory idempotent consumer (naive)     ⏳ next
-5. Breaking in-memory idempotency            ⏳ upcoming
-6. Persistent idempotency (DB table)         ⏳ upcoming
-7. Retryable vs non-retryable exceptions
-8. Manual / different acknowledgement modes
-9. Multiple partitions
-10. Multiple instances of notification service
-11. Consumer group load balancing
-12. Consumer rebalance
-13. Kafka key and ordering
-14. Multiple brokers
-15. Replication factor
-16. Leader / follower failover
-17. Producer acknowledgements (acks)
-18. Idempotent producer
-19. Kafka delivery semantics
-20. PostgreSQL + Kafka failure window
-21. Transactional Outbox
-22. Outbox publisher
-23. Eventual consistency
-24. OpenSearch read model
-25. Redis where useful
-26. Observability / correlation ID
-27. Docker Compose
-28. Kubernetes deployment
+order-events
+     |
+     v
+OrderEventListener
+     |
+     +---> 1. Check: isAlreadyProcessed(orderId)?
+     |          |
+     |          +---> YES -> Log & skip (Idempotent ignore)
+     |          |
+     |          +---> NO  -> Continue
+     |
+     +---> 2. Send Email Notification (Mailpit)
+     |
+     +---> 3. Mark: markAsProcessed(orderId) (Persist to DB)
+```
+
+### Database Schema & Composite Natural Key
+
+- **Schema**: `order_notification`
+- **Table**: `processed_events`
+- **Unique Constraint**: `uk_processed_order_event` on `(order_id, event_type)`
+
+#### Why `(order_id, event_type)` instead of only `order_id`?
+An order progresses through multiple stages in its lifecycle:
+- `ORDER_PLACED`
+- `ORDER_PAID`
+- `ORDER_SHIPPED`
+- `ORDER_CANCELLED`
+
+If the table only keyed on `order_id`, processing `ORDER_PLACED` would mistakenly block subsequent valid events like `ORDER_SHIPPED` for the same order.
+
+```java
+@Entity
+@Table(
+        name = "processed_events",
+        schema = "order_notification",
+        uniqueConstraints = {
+                @UniqueConstraint(
+                        name = "uk_processed_order_event",
+                        columnNames = {"order_id", "event_type"}
+                )
+        }
+)
+public class ProcessedEventEntity {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "order_id", nullable = false)
+    private Long orderId;
+
+    @Column(name = "event_type", nullable = false)
+    private String eventType;
+
+    @Column(name = "processed_at", nullable = false)
+    private LocalDateTime processedAt;
+}
+```
+
+### Service Layer (`NotificationService.java`)
+
+```java
+@Service
+@RequiredArgsConstructor
+public class NotificationService {
+    private final ProcessedEventRepository processedEventRepository;
+
+    public boolean isAlreadyProcessed(Long orderId) {
+        return processedEventRepository
+                .existsByOrderIdAndEventType(orderId, "ORDER_PLACED");
+    }
+
+    @Transactional
+    public void markAsProcessed(Long orderId) {
+        ProcessedEventEntity entity = ProcessedEventEntity.builder()
+                .orderId(orderId)
+                .eventType("ORDER_PLACED")
+                .processedAt(LocalDateTime.now())
+                .build();
+        processedEventRepository.save(entity);
+    }
+}
+```
+
+### Replay Experiment with Persistent Idempotency
+- Produced normal order `orderId=13` at offset `10`.
+- Processed once -> stored in `order_notification.processed_events`.
+- Consumer stopped -> offset shifted backward: `11 -> 10`.
+- Service restarted -> Kafka re-delivered offset `10`.
+- Application output: `Duplicate event ignored for orderId=13`.
+- **Result**: Proved persistent DB idempotency survives JVM restarts and correctly suppresses duplicate actions.
+
+---
+
+# 32. Non-Retryable vs. Retryable Exception Handling
+
+**Status: DONE**
+
+Not all consumer errors should be retried. We separated transient failures from fatal/business validation errors.
+
+### Distinction
+
+1. **Retryable Exceptions (`NotificationTemporaryException`)**:
+   - Caused by transient issues (e.g., Mailpit network timeout, temporary downstream failure, 503, rate limiting).
+   - Configured with `FixedBackOff(1000L, 2L)`: retries 2 times (total 3 attempts) before forwarding to `order-events.DLT`.
+   - Simulated using `productId == 9999L`.
+
+2. **Non-Retryable Exceptions (`InvalidOrderEventException`)**:
+   - Caused by unrecoverable payload or business validation errors (e.g., negative quantity, malformed ID).
+   - Retrying will never succeed and only wastes CPU cycles, network bandwidth, and increases consumer lag.
+   - Configured via `errorHandler.addNotRetryableExceptions(InvalidOrderEventException.class)` in `KafkaErrorHandlerConfig.java`.
+   - Simulated using `productId == 8888L` -> Skips retries and immediately routes to `order-events.DLT`.
+
+```java
+@Bean
+public DefaultErrorHandler kafkaErrorHandler(DeadLetterPublishingRecoverer recoverer) {
+    DefaultErrorHandler errorHandler =
+            new DefaultErrorHandler(recoverer, new FixedBackOff(1000L, 2L));
+
+    errorHandler.addNotRetryableExceptions(
+            InvalidOrderEventException.class
+    );
+
+    return errorHandler;
+}
+```
+
+**Production Rule**: Only retry operations that have a realistic chance of succeeding on a subsequent attempt.
+
+---
+
+# 33. Real Email Integration via Mailpit & Infrastructure Setup
+
+**Status: DONE**
+
+We added real SMTP email dispatch using Mailpit (local SMTP mock server running on port 1025 with web UI on port 8025).
+
+### Mailpit Container Launch
+
+```bash
+docker run -d \
+  --name mailpit \
+  -p 1025:1025 \
+  -p 8025:8025 \
+  axllent/mailpit
+```
+
+- **SMTP Server**: `localhost:1025`
+- **Web UI**: `http://localhost:8025`
+
+### Docker Desktop Credential Resolution (Colima)
+When Docker Desktop is removed and Docker runs via Colima, running `docker pull` may fail with:
+```text
+docker-credential-desktop: executable file not found
+```
+**Fix**: Edit `~/.docker/config.json` and remove the line `"credsStore": "desktop"`.
+
+### Implementation (`EmailNotificationService.java`)
+
+```java
+@Service
+@RequiredArgsConstructor
+public class EmailNotificationService {
+    private final JavaMailSender mailSender;
+
+    public void sendOrderPlacedEmail(OrderPlacedEvent event) {
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setFrom("orders@poc.local");
+        message.setTo("customer-" + event.customerId() + "@poc.local");
+        message.setSubject("Order " + event.orderId() + " placed successfully");
+        message.setText("""
+                Your order has been placed successfully.
+
+                Order ID: %d
+                Customer ID: %d
+                Product ID: %d
+                Quantity: %d
+                """.formatted(
+                event.orderId(),
+                event.customerId(),
+                event.productId(),
+                event.quantity()
+        ));
+
+        mailSender.send(message);
+    }
+}
 ```
 
 ---
 
-# 31. Multi-Partition Experiment Planned
+# 34. Dual-Write Failure Window & Post-Side-Effect Crash
+
+**Status: DONE**
+
+We explored the ordering of consumer idempotency operations and demonstrated the classic distributed-systems dual-write problem.
+
+### 1. Ordering of Idempotency Logic
+
+Why is `markAsProcessed -> sendEmail` dangerous?
+```text
+markAsProcessed (DB saved) ✅
+       ↓
+sendEmail (fails ❌)
+       ↓
+Kafka retries event
+       ↓
+DB check says "already processed" -> event skipped!
+       ↓
+Email is NEVER sent ❌ (Lost business side-effect)
+```
+
+Therefore, the correct execution order is:
+```text
+1. check isAlreadyProcessed() -> if true, skip
+2. execute side-effect (send email)
+3. markAsProcessed() in DB
+```
+
+### 2. The Remaining Crash Window (`productId == 7777L`)
+
+Even with `check -> execute -> mark`, there is an inherent failure window:
+
+```text
+email sent successfully to Mailpit ✅
+       ↓
+APPLICATION CRASHES BEFORE DB INSERT ❌
+       ↓
+Kafka listener throws exception
+       ↓
+Kafka retries message
+       ↓
+DB check still returns false (no marker exists)
+       ↓
+Email sent AGAIN ❌ (Duplicate side-effect)
+```
+
+### 3. Simulation Code (`OrderEventListener.java`)
+
+```java
+// Real external side effect
+emailNotificationService.sendOrderPlacedEmail(event);
+System.out.println("Email sent for orderId=" + event.orderId());
+
+if (event.productId().equals(7777L)) {
+    System.out.println("CRASH AFTER EMAIL, BEFORE DB MARKER");
+    throw new RuntimeException("Simulated crash after sending email");
+}
+
+notificationService.markAsProcessed(event.orderId());
+```
+
+### 4. Observed Behavior
+- **Input**: 1 HTTP request -> 1 Kafka record (`orderId=14`, `productId=7777`).
+- **Execution**: Initial attempt (email #1 + crash) -> Retry 1 (email #2 + crash) -> Retry 2 (email #3 + crash) -> Forwarded to DLT.
+- **Mailpit Web UI**: Received **3 duplicate emails** for the single order event.
+
+### 5. Core Architectural Insights
+1. **Producer Success vs. Consumer Success**:
+   - The Kafka producer successfully publishing a record only means the record was safely written to the Kafka log.
+   - It does NOT mean consumer business processing succeeded. Kafka only knows if the consumer listener returned normally (success) or threw an exception (failure).
+2. **Why DB Idempotency Alone Is Not Enough**:
+   - Database transactions (`@Transactional`) cannot encompass external network systems (SMTP, payment gateways, third-party APIs).
+   - If an external call succeeds, you cannot roll it back when the database insert subsequently fails.
+
+---
+
+# 35. Summary of Failure Simulation Test Values
+
+| `productId` | Simulated Scenario | Expected Flow & Outcome |
+| :--- | :--- | :--- |
+| `5005` (or any normal ID) | **Normal Successful Flow** | Email sent -> Marker saved -> Offset committed |
+| `9999` | **Retryable Temporary Failure** | Initial + 2 retries (3 total attempts @ 1s delay) -> Routed to `order-events.DLT` |
+| `8888` | **Non-Retryable Invalid Event** | Retries skipped immediately -> Routed directly to `order-events.DLT` |
+| `7777` | **Post-Side-Effect Crash** | Email sent -> Crash before DB marker -> 3 emails sent across retries -> Routed to DLT |
+
+---
+
+# 36. End-to-End System Architecture
+
+```text
+                   POST /api/orders
+                          |
+                          v
+                 order-event-service
+                          |
+                          +---> PostgreSQL: order_event.orders
+                          |
+                          v (OrderPlacedEvent)
+                 Kafka Topic: order-events
+                          |
+                          v
+                 order-notification-service
+                          |
+             +------------+------------+
+             |                         |
+             v                         v
+     isAlreadyProcessed()?     errorHandler (FixedBackOff / Non-Retryable)
+      [PostgreSQL DB]                  |
+             |                         v (Retries Exhausted)
+     +-------+-------+          Kafka Topic: order-events.DLT
+     |               |
+   [YES]            [NO]
+     |               |
+Skip Duplicate       v
+             sendOrderPlacedEmail()
+                     |
+                     v
+             Mailpit SMTP (localhost:1025)
+                     |
+                     v
+             markAsProcessed() -> PostgreSQL: order_notification.processed_events
+```
+
+---
+----
+Questions
+1. Why exists() → send email → insert marker still has race/failure windows
+2. Unique constraint and concurrent consumers
+3. Stable eventId/idempotency key instead of relying only on orderId
+4. Provider-side idempotency when an external API supports it
+5. Inbox / processed-message pattern
+6. What Transactional Outbox actually solves
+7. Why Outbox solves producer-side DB→Kafka consistency,
+   but does NOT automatically solve duplicate email side effects
+
+# 37. Planned Learning Roadmap
+
+After DLT, Duplicate Delivery, Persistent Idempotency, and Exception Classification, continue in this order:
+
+```text
+ 1. Explicit retry configuration              ✅
+ 2. Dead Letter Topic (DLT)                   ✅
+ 3. Duplicate delivery via offset reset       ✅
+ 4. In-Memory idempotent consumer (naive)     ✅
+ 5. Breaking in-memory idempotency            ✅
+ 6. Persistent idempotency (DB table)         ✅
+ 7. Retryable vs non-retryable exceptions     ✅
+ 8. Mailpit real email integration            ✅
+ 9. Crash window after external side effect   ✅
+10. Multiple partitions                      ⏳ next
+11. Multiple instances of notification service ⏳ upcoming
+12. Consumer group load balancing
+13. Consumer rebalance
+14. Kafka key and ordering
+15. Multiple brokers
+16. Replication factor
+17. Leader / follower failover
+18. Producer acknowledgements (acks)
+19. Idempotent producer
+20. Kafka delivery semantics
+21. PostgreSQL + Kafka failure window
+22. Transactional Outbox
+23. Outbox publisher
+24. Eventual consistency
+25. OpenSearch read model
+26. Redis where useful
+27. Observability / correlation ID
+28. Docker Compose
+29. Kubernetes deployment
+```
+
+---
+
+# 38. Deep-Dive Topics to Explore Next
+
+### 1. Handling Non-Atomic Side Effects (Inbox Pattern & Idempotency Keys)
+- How to safely design consumer side effects when Kafka message + external provider + database state cannot be committed atomically.
+- **Provider-Side Idempotency**: Supplying an `Idempotency-Key` or deterministic `eventId` in external API headers so the provider rejects duplicate requests.
+- **Transactional Inbox Pattern**: Persisting incoming messages to an `inbox` table within the local DB transaction before invoking asynchronous dispatch workers.
+
+### 2. Concurrency & Race Conditions in Consumers
+- When multiple consumer threads or instances read concurrently:
+  - `if (!exists()) { insert(); }` contains a classic **check-then-act** race condition.
+  - Relying on the DB `UNIQUE` constraint `(order_id, event_type)` with optimistic locking / duplicate key exception catching is essential for concurrency safety.
+
+### 3. Outbox vs. Inbox Distinction
+- **Transactional Outbox**: Solves the *producer-side* dual-write problem (DB commit + Kafka publish).
+- **Transactional Inbox / Idempotent Consumer**: Solves the *consumer-side* duplicate delivery & side-effect problem.
+
+---
+
+# 39. Multi-Partition Experiment Planned
 
 Later change:
 
@@ -1613,7 +2018,7 @@ We will test:
 
 ---
 
-# 32. Multi-Consumer Experiment Planned
+# 40. Multi-Consumer Experiment Planned
 
 With 3 partitions:
 
@@ -1650,7 +2055,7 @@ Stop one consumer and observe the rebalance.
 
 ---
 
-# 33. Multi-Broker Experiment Planned
+# 41. Multi-Broker Experiment Planned
 
 Later run multiple Kafka brokers.
 
@@ -1692,7 +2097,7 @@ practical rather than theoretical.
 
 ---
 
-# 34. OpenSearch Plan
+# 42. OpenSearch Plan
 
 PostgreSQL will remain the source of truth.
 
@@ -1731,7 +2136,7 @@ This will introduce:
 
 ---
 
-# 35. Core Mental Models So Far
+# 43. Core Mental Models So Far
 
 ## Broker
 
@@ -1817,6 +2222,12 @@ routes unrecoverable / retry-exhausted messages to a Dead Letter Topic (DLT)
 side topic holding failed messages with diagnostic headers to avoid poison-pill consumer blocking
 ```
 
+## Non-Retryable Exception
+
+```text
+errors that will never succeed upon retry (e.g., malformed format, validation error); bypassed straight to DLT
+```
+
 ## Offset Reset / Replay
 
 ```text
@@ -1835,9 +2246,21 @@ the same Kafka record may be processed more than once due to retries, crashes, o
 consumer business logic designed to produce the same outcome regardless of how many times a message is delivered
 ```
 
+## Persistent Idempotency Table
+
+```text
+durable database table with unique constraint ensuring exactly-once business outcome across service restarts and scale-out instances
+```
+
+## Side-Effect Crash Window
+
+```text
+window between performing a non-rollbackable external side effect (e.g. SMTP email) and recording its completion in the database
+```
+
 ---
 
-# 36. Commands Used Frequently
+# 44. Commands Used Frequently
 
 Check Kafka container:
 
@@ -1930,6 +2353,12 @@ docker exec -it kafka-poc \
   --execute
 ```
 
+Check processed events in PostgreSQL:
+
+```sql
+SELECT * FROM order_notification.processed_events ORDER BY id DESC;
+```
+
 Check Colima:
 
 ```bash
@@ -1950,33 +2379,35 @@ colima stop
 
 ---
 
-# 37. Current Checkpoint
+# 45. Current Checkpoint
 
 At this checkpoint:
 
 ```text
-Producer works                     ✅
-PostgreSQL persistence works       ✅
-Kafka broker works                 ✅
-Kafka topic works                  ✅
-Long key works                     ✅
-JSON event works                   ✅
-Real consumer works                ✅
-Consumer group works               ✅
-Offset observed                    ✅
-Lag observed                       ✅
-Offline consumer recovery          ✅
-Failure simulation                 ✅
-Same-offset retries observed       ✅
-Dead Letter Topic (DLT)            ✅
-Duplicate Delivery (Offset Reset)  ✅
+Producer works                          ✅
+PostgreSQL persistence works            ✅
+Kafka broker works                      ✅
+Kafka topic works                       ✅
+Long key works                          ✅
+JSON event works                        ✅
+Real consumer works                     ✅
+Consumer group works                    ✅
+Offset observed                         ✅
+Lag observed                            ✅
+Offline consumer recovery               ✅
+Failure simulation                      ✅
+Same-offset retries observed            ✅
+Dead Letter Topic (DLT)                 ✅
+Duplicate Delivery (Offset Reset)       ✅
+In-Memory Idempotency (Naive)           ✅
+Persistent Idempotency (DB Table)       ✅
+Retryable vs Non-retryable Errors       ✅
+Mailpit Real Email Integration          ✅
+Side-effect crash window demonstrated   ✅
 
-In-Memory Idempotency (Naive)      ⏳ next
-Persistent Idempotency (DB Table)  ⏳ upcoming
-Retryable vs Non-retryable Errors  ⏳ upcoming
-Multiple partitions                ⏳ later
-Multiple consumers                 ⏳ later
-Multiple brokers                   ⏳ later
-Outbox                             ⏳ later
-OpenSearch                         ⏳ later
+Multiple partitions                     ⏳ next
+Multiple consumers                      ⏳ upcoming
+Multiple brokers                        ⏳ later
+Outbox                                  ⏳ later
+OpenSearch                              ⏳ later
 ```

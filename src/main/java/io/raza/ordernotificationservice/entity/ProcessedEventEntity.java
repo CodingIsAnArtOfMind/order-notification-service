@@ -4,6 +4,7 @@ import jakarta.persistence.*;
 import lombok.*;
 
 import java.time.LocalDateTime;
+import java.util.UUID;
 
 @Entity
 @Table(
@@ -11,8 +12,8 @@ import java.time.LocalDateTime;
         schema = "order_notification",
         uniqueConstraints = {
                 @UniqueConstraint(
-                        name = "uk_processed_order_event",
-                        columnNames = {"order_id", "event_type"}
+                        name = "uk_processed_event_id",
+                        columnNames = "event_id"
                 )
         }
 )
@@ -26,6 +27,9 @@ public class ProcessedEventEntity {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Column(name = "event_id", nullable = false)
+    private UUID eventId;
 
     @Column(name = "order_id", nullable = false)
     private Long orderId;
