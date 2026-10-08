@@ -6,6 +6,7 @@ import io.raza.ordernotificationservice.exception.InvalidOrderEventException;
 import io.raza.ordernotificationservice.exception.NotificationTemporaryException;
 import io.raza.ordernotificationservice.notification.EmailNotificationService;
 import io.raza.ordernotificationservice.service.NotificationService;
+import io.raza.ordernotificationservice.service.OrderNotificationProcessor;
 import lombok.AllArgsConstructor;
 import lombok.RequiredArgsConstructor;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -20,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class OrderEventListener {
     private final NotificationService notificationService;
     private final EmailNotificationService emailNotificationService;
+    private final OrderNotificationProcessor processor;
 
     @KafkaListener(topics = "order-events")
     public void handleOrderPlaced(
@@ -29,20 +31,23 @@ public class OrderEventListener {
 
         System.out.println(
                 "Received event"
+                        + " | eventId=" + event.eventId()
                         + " | key=" + record.key()
                         + " | partition=" + record.partition()
                         + " | offset=" + record.offset()
                         + " | orderId=" + event.orderId()
-                        + " | customerId=" + event.customerId()
-                        + " | productId=" + event.productId()
         );
 
-        // Persistent duplicate check
-        if (notificationService.isAlreadyProcessed(event.orderId())) {
+        if (notificationService.isAlreadyProcessed(event.eventId())) {
             System.out.println(
-                    "Duplicate event ignored for orderId="
-                            + event.orderId()
+                    "Duplicate event ignored"
+                            + " | eventId=" + event.eventId()
+                            + " | key=" + record.key()
+                            + " | partition=" + record.partition()
+                            + " | offset=" + record.offset()
+                            + " | orderId=" + event.orderId()
             );
+
             return;
         }
 
@@ -63,14 +68,21 @@ public class OrderEventListener {
                     "Invalid order event"
             );
         }
+
         // Real external side effect
         emailNotificationService.sendOrderPlacedEmail(event);
 
-        System.out.println(
-                "Email sent for orderId=" + event.orderId()
-        );
+        System.out.println("Email sent for orderId=" + event.orderId());
+
+        if (event.productId().equals(7777L)) {
+            System.out.println("CRASH AFTER EMAIL, BEFORE DB MARKER");
+
+            throw new RuntimeException(
+                    "Simulated crash after sending email"
+            );
+        }
 
         // Only mark processed AFTER email succeeds
-        notificationService.markAsProcessed(event.orderId());
+        notificationService.markAsProcessed(event);
     }
 }
