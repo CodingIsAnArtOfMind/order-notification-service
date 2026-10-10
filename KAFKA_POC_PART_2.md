@@ -966,89 +966,931 @@ consumer group offset
 
 ---
 
-# 25. Next Experiment — Concurrent Duplicate Race
+---
 
-Current code still has this pattern:
+# 25. Concurrent Duplicate Race — Why We Tested It
 
-```java
-if (!repository.existsByEventId(eventId)) {
-    // process
-    repository.save(...)
-}
-```
-
-This has a race.
-
-We want to deliberately create:
+At this point our consumer-side idempotency looked like:
 
 ```text
-Thread / Consumer A
-    |
-    | exists? false
-    |
-    +------------------+
-                       |
-Thread / Consumer B   |
-    |                  |
-    | exists? false    |
-    |                  |
-    +------------------+
-                       |
-                       v
-              both try to process
+existsByEventId(eventId)?
+        |
+        ├── YES → duplicate → return
+        |
+        └── NO
+              ↓
+          send email
+              ↓
+          insert processed event
 ```
 
-Goal:
+The concern was that `exists() -> act() -> insert()` is a **check-then-act** sequence, not one atomic operation.
 
-1. Prove `exists() → act → insert()` is not atomic.
-2. Observe what the `UNIQUE(event_id)` constraint does.
-3. Decide whether `exists()` is merely an optimization or should be removed.
-4. Understand DB constraint violations under concurrency.
-5. Design a better atomic consumer-side claim/process pattern.
-6. Connect this to Inbox / Processed Message semantics.
+Two concurrent executions could both observe that the same `eventId` does not exist before either inserts the marker.
 
-This is the next checkpoint.
+The question we tested was:
+
+> Can two threads process the SAME `eventId`, both pass the application-level duplicate check, and both perform the external side effect?
 
 ---
 
-# 26. Upcoming Roadmap
+# 26. Processing Logic Extracted into `OrderNotificationProcessor`
+
+To test the same business-processing logic from multiple threads without constructing Kafka `ConsumerRecord` objects manually, reusable work was moved into:
+
+```text
+io.raza.ordernotificationservice.service.OrderNotificationProcessor
+```
+
+Responsibility split:
+
+```text
+OrderEventListener
+    |
+    | Kafka-specific work
+    | - receive ConsumerRecord
+    | - log partition / offset / key
+    | - Kafka failure simulations
+    v
+OrderNotificationProcessor
+    |
+    | business processing
+    | - idempotency
+    | - email side effect
+    | - DB processing state
+```
+
+This made the processing logic directly testable from multiple threads.
+
+---
+
+# 27. Concurrency Test Harness — Why Two `CountDownLatch` Objects Were Used
+
+We wanted two worker threads to enter the race at almost the same time.
+
+A thread pool does NOT guarantee that submitted tasks reach the critical code together, so the test used two latches:
+
+```java
+CountDownLatch readyLatch =
+        new CountDownLatch(numberOfThreads);
+
+CountDownLatch startLatch =
+        new CountDownLatch(1);
+```
+
+## `readyLatch`
+
+For two workers:
+
+```text
+readyLatch = 2
+```
+
+Each worker executes:
+
+```java
+readyLatch.countDown();
+```
+
+So:
+
+```text
+Thread 1 ready → 2 → 1
+Thread 2 ready → 1 → 0
+```
+
+The test thread waits using:
+
+```java
+readyLatch.await();
+```
+
+so it does not release the race until all workers are ready.
+
+## `startLatch`
+
+The start latch is:
+
+```text
+startLatch = 1
+```
+
+Every worker waits on:
+
+```java
+startLatch.await();
+```
+
+Then the test thread performs one:
+
+```java
+startLatch.countDown();
+```
+
+which changes:
+
+```text
+1 → 0
+```
+
+and releases ALL waiting workers.
+
+Important:
+
+```text
+CountDownLatch(1)
+```
+
+does not mean one thread. It means one countdown signal is required before the gate opens.
+
+A latch never becomes negative. Once the count reaches zero, later `countDown()` calls leave it at zero.
+
+Mental model:
+
+```text
+Thread 1 READY ──┐
+                 |
+Thread 2 READY ──┤
+                 |
+readyLatch = 0   |
+                 v
+        ALL THREADS READY
+                 |
+                 v
+       startLatch 1 → 0
+            /          \
+           v            v
+      Thread 1      Thread 2
+        starts        starts
+```
+
+---
+
+# 28. Race Window Simulation
+
+For the concurrency experiment we introduced a POC-only product ID:
+
+```text
+productId = 6666
+```
+
+After the old duplicate check succeeded, the processor deliberately waited:
+
+```java
+if (event.productId().equals(6666L)) {
+    Thread.sleep(2000);
+}
+```
+
+This was not business logic. It deliberately widened the race window so both threads had time to execute:
+
+```text
+existsByEventId(eventId) = false
+```
+
+before either thread inserted the processed marker.
+
+---
+
+# 29. Concurrent Race — Actual Result
+
+Both threads processed the exact same `eventId`.
+
+Observed behavior:
+
+```text
+Thread 1 passed duplicate check
+Thread 2 passed duplicate check
+
+Thread 1 EMAIL SENT
+Thread 2 EMAIL SENT
+```
+
+Then both attempted to insert the same `event_id`.
+
+PostgreSQL allowed one insert and rejected the other with:
+
+```text
+SQLState: 23505
+
+duplicate key value violates unique constraint
+"uk_processed_event_id"
+```
+
+The losing thread received a `DataIntegrityViolationException`.
+
+Result:
+
+```text
+Application exists() check      ❌ race-prone
+
+External side effect            ❌ email executed twice
+
+UNIQUE(event_id)                ✅ only one DB row allowed
+```
+
+This proved:
+
+> A unique constraint protects database state, but it cannot undo an external side effect that already happened before the conflicting insert.
+
+So this state was possible:
+
+```text
+2 emails
+1 processed_events row
+```
+
+---
+
+# 30. Architecture Decision — Replace Check-Then-Act with Atomic Claim
+
+The unsafe flow:
+
+```text
+SELECT exists?
+      ↓
+send email
+      ↓
+INSERT processed marker
+```
+
+was replaced with an Inbox-style **atomic claim**.
+
+New idea:
+
+```text
+Try to INSERT eventId first
+        |
+        ├── INSERT succeeds
+        |      ↓
+        |   this worker owns the event
+        |
+        └── conflict
+               ↓
+           another worker already owns / processed it
+```
+
+The database, rather than application timing, decides the winner atomically.
+
+---
+
+# 31. New Inbox Table
+
+A new table was introduced:
+
+```text
+order_notification.inbox_events
+```
+
+Conceptual columns:
+
+```text
+event_id
+order_id
+event_type
+status
+claimed_at
+completed_at
+```
+
+The `event_id` is the row identity, so one logical event can only have one Inbox row.
+
+The lifecycle fields allow us to distinguish ownership from successful completion.
+
+---
+
+# 32. Atomic Claim with PostgreSQL `ON CONFLICT`
+
+Instead of `SELECT exists` followed later by `INSERT`, the repository performs one atomic PostgreSQL statement:
+
+```sql
+INSERT INTO order_notification.inbox_events
+    (event_id, order_id, event_type, status, claimed_at)
+VALUES
+    (:eventId, :orderId, :eventType, 'PROCESSING', NOW())
+ON CONFLICT (event_id) DO NOTHING;
+```
+
+The affected-row count tells us who won:
+
+```text
+Thread 1 INSERT
+    ↓
+affected rows = 1
+    ↓
+CLAIMED
+
+Thread 2 INSERT same eventId
+    ↓
+ON CONFLICT DO NOTHING
+    ↓
+affected rows = 0
+    ↓
+ALREADY CLAIMED
+```
+
+There is no separate application-level existence check before ownership is established.
+
+---
+
+# 33. `InboxService` Transaction Boundary
+
+The Inbox claim was given its own committed transaction using the equivalent of:
+
+```java
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public boolean tryClaim(OrderPlacedEvent event) {
+    ...
+}
+```
+
+Intended flow:
+
+```text
+BEGIN DB TRANSACTION
+      ↓
+INSERT PROCESSING claim
+      ↓
+COMMIT
+      ↓
+claim visible to other workers
+      ↓
+external email work starts
+```
+
+`markCompleted()` later changes:
+
+```text
+PROCESSING
+    ↓
+COMPLETED
+```
+
+when business processing finishes successfully.
+
+---
+
+# 34. Atomic Claim Concurrency Test — Actual Result
+
+We reran the SAME two-thread test with the SAME `eventId`.
+
+Actual output showed:
+
+```text
+pool-2-thread-1 CLAIMED EVENT
+pool-2-thread-2 EVENT ALREADY CLAIMED
+
+pool-2-thread-1 EMAIL SENT
+pool-2-thread-1 EVENT COMPLETED
+```
+
+Only one thread was allowed beyond the claim.
+
+Result changed from:
+
+```text
+BEFORE atomic claim
+
+2 workers
+→ both passed exists()
+→ 2 emails
+→ DB rejected second insert
+```
+
+to:
+
+```text
+AFTER atomic claim
+
+2 workers
+→ PostgreSQL chose one owner
+→ second worker stopped before side effect
+→ 1 email
+→ 1 Inbox row
+→ status COMPLETED
+```
+
+This successfully fixed the **concurrent duplicate side-effect race**.
+
+The Kafka coordinator/rebalance logs visible during the test were incidental: `@SpringBootTest` started the full application context, including the Kafka listener. They were not part of the race itself.
+
+---
+
+# 35. What Atomic Claim Solved
+
+Atomic claiming solved this problem:
+
+```text
+Two workers process same event concurrently
+        ↓
+both think event is new
+        ↓
+both perform side effect
+```
+
+Now:
+
+```text
+same eventId
+     ↓
+atomic DB INSERT
+     ↓
+one winner
+     ↓
+only winner performs side effect
+```
+
+Current conceptual flow:
+
+```text
+Kafka event
+    ↓
+atomic inbox claim
+    |
+    ├── claim lost
+    |      ↓
+    |    return
+    |
+    └── claim won
+           ↓
+       send email
+           ↓
+       mark COMPLETED
+```
+
+---
+
+# 36. New Problem Introduced by Claim-First Design
+
+Fixing the concurrent race exposed another failure window.
+
+Current flow:
+
+```text
+1. Claim event in DB
+2. Commit status = PROCESSING
+3. Send email
+4. Mark status = COMPLETED
+```
+
+Question:
+
+> What happens if the process dies AFTER step 2 but BEFORE step 3?
+
+Then:
+
+```text
+Inbox claim exists ✅
+status = PROCESSING
+email sent = NO ❌
+completed_at = NULL
+```
+
+When Kafka retries the same record, the simple claim logic sees:
+
+```text
+event_id already exists
+```
+
+and returns:
+
+```text
+EVENT ALREADY CLAIMED
+```
+
+The listener can then return normally even though the actual business side effect never happened.
+
+This means:
+
+```text
+"row exists"
+```
+
+is NOT equivalent to:
+
+```text
+"processing completed"
+```
+
+---
+
+# 37. Crash-After-Claim Test
+
+To reproduce this failure deliberately, another POC-only product ID was introduced:
+
+```text
+productId = 5555
+```
+
+Processor logic conceptually became:
+
+```java
+boolean claimed = inboxService.tryClaim(event);
+
+if (!claimed) {
+    return;
+}
+
+if (event.productId().equals(5555L)) {
+    throw new RuntimeException(
+            "Simulated crash after inbox claim before email"
+    );
+}
+
+emailNotificationService.sendOrderPlacedEmail(event);
+
+inboxService.markCompleted(event);
+```
+
+So `5555` means:
+
+```text
+CLAIM EVENT ✅
+     ↓
+CRASH ❌
+     ↓
+DO NOT SEND EMAIL
+     ↓
+DO NOT MARK COMPLETED
+```
+
+---
+
+# 38. How We Confirmed the `5555` Test Really Happened
+
+First we verified the producer-side order existed:
+
+```sql
+SELECT *
+FROM order_event.orders
+WHERE product_id = 5555
+ORDER BY created_at DESC;
+```
+
+The order existed with:
+
+```text
+status = PLACED
+```
+
+That proved:
+
+```text
+HTTP request reached order-event-service ✅
+order was stored in PostgreSQL ✅
+```
+
+Then we inspected the consumer Inbox row.
+
+Observed state:
+
+```text
+status       = PROCESSING
+claimed_at   = <timestamp>
+completed_at = NULL
+```
+
+This proved:
+
+```text
+Kafka event reached notification service ✅
+Inbox claim committed ✅
+Crash simulation executed after claim ✅
+Email-processing path did not complete ❌
+markCompleted() never executed ❌
+```
+
+---
+
+# 39. Current Bug — Stuck `PROCESSING` Claim
+
+The exact state we now have is:
+
+```text
+event_id       = <event UUID>
+status         = PROCESSING
+claimed_at     = populated
+completed_at   = NULL
+```
+
+The current implementation treats an existing row as simply:
+
+```text
+already claimed
+```
+
+without asking whether that claim:
+
+```text
+completed successfully
+```
+
+or:
+
+```text
+belongs to a crashed worker
+```
+
+Therefore a retry can behave like:
+
+```text
+Kafka retries same event
+      ↓
+INSERT ... ON CONFLICT DO NOTHING
+      ↓
+0 rows inserted
+      ↓
+EVENT ALREADY CLAIMED
+      ↓
+return normally
+      ↓
+event may never receive its email
+```
+
+This is the **current unresolved issue**.
+
+---
+
+# 40. Important Learning — Existence Is Not Completion
+
+Before the Inbox stage, the question was mostly:
+
+```text
+Does an event row exist?
+```
+
+The `5555` experiment proved that the real question is:
+
+```text
+What state is that event in?
+```
+
+We now need to distinguish at least:
+
+```text
+PROCESSING
+COMPLETED
+```
+
+and probably later:
+
+```text
+FAILED
+```
+
+A row in `PROCESSING` cannot automatically be treated as a successful duplicate.
+
+---
+
+# 41. Current Inbox State Machine
+
+Current intended lifecycle:
+
+```text
+NO ROW
+   ↓
+claim succeeds
+   ↓
+PROCESSING
+   ↓
+send external side effect
+   ↓
+COMPLETED
+```
+
+But we discovered this failure path:
+
+```text
+NO ROW
+   ↓
+PROCESSING
+   ↓
+CRASH
+   ↓
+stuck PROCESSING
+```
+
+The system currently has no recovery rule for that state.
+
+---
+
+# 42. Next Architectural Question — NOT FIXED YET
+
+The next problem to solve is:
+
+> How can another worker safely recover an event that is still `PROCESSING` because the original worker crashed?
+
+We need to distinguish:
+
+```text
+COMPLETED
+    → true duplicate
+    → ignore safely
+
+PROCESSING + recent claim
+    → another worker may still be actively processing
+    → should not steal immediately
+
+PROCESSING + stale/old claim
+    → original worker probably crashed
+    → should become eligible for recovery/reclaim
+```
+
+This naturally leads to concepts such as:
+
+```text
+claim timeout
+lease expiration
+stale-claim detection
+retry ownership
+FAILED / retryable status
+```
+
+No stale-claim recovery has been implemented yet.
+
+That is the next POC stage.
+
+---
+
+# 43. Updated Failure Simulation IDs
+
+| Product ID | Purpose |
+|---:|---|
+| `5005` | Normal successful flow |
+| `9999` | Temporary / retryable consumer failure |
+| `8888` | Non-retryable invalid event |
+| `7777` | Email succeeds, crash before completion marker |
+| `6666` | Widen concurrency window for duplicate race |
+| `5555` | Claim succeeds, crash BEFORE email |
+
+---
+
+# 44. Updated Architecture
+
+```text
+Client
+  |
+  | POST /api/orders
+  v
+order-event-service
+  |
+  +---- PostgreSQL
+  |       order_event.orders
+  |
+  +---- create stable eventId
+  |
+  +---- KafkaTemplate
+           |
+           | key = orderId
+           v
+      order-events
+           |
+           v
+ order-notification-service
+           |
+           v
+      Inbox atomic claim
+           |
+           | INSERT ... ON CONFLICT DO NOTHING
+           |
+       +---+----------------------+
+       |                          |
+       | claim won                | claim lost
+       v                          v
+ status=PROCESSING              return
+       |
+       v
+ send email
+       |
+       v
+ mark COMPLETED
+       |
+       v
+ completed_at set
+
+Failure discovered:
+
+PROCESSING
+    |
+    X crash before email
+    |
+    v
+stuck PROCESSING row
+```
+
+---
+
+# 45. What We Have Proven in Part 2 So Far
+
+```text
+✅ Stable eventId is better than using orderId as exact message identity
+
+✅ Same Kafka replay carries the same eventId
+
+✅ eventId-based replay deduplication works after successful processing
+
+✅ exists() → act → insert() is NOT concurrency-safe
+
+✅ Two concurrent workers can both pass exists() == false
+
+✅ UNIQUE(event_id) protects DB state but cannot undo duplicate emails
+
+✅ Atomic INSERT ... ON CONFLICT can establish one owner
+
+✅ Atomic Inbox claim reduced concurrent duplicate side effect:
+   2 emails → 1 email
+
+✅ PROCESSING / COMPLETED lifecycle is necessary
+
+✅ Claim-first design has its own crash window
+
+✅ productId=5555 reproduced:
+   claim persisted
+   email never completed
+   status stuck at PROCESSING
+
+✅ Database verification confirmed:
+   claimed_at populated
+   completed_at NULL
+
+✅ "event row exists" does NOT mean "event completed"
+```
+
+---
+
+# 46. Current Checkpoint
+
+We are currently HERE:
+
+```text
+Atomic claim             ✅ implemented
+Concurrent duplicate fix ✅ verified
+Inbox PROCESSING state   ✅ implemented
+Inbox COMPLETED state    ✅ implemented
+
+Crash after claim
+before email             ✅ reproduced
+
+Stuck PROCESSING row     ✅ verified
+
+Stale claim recovery     ❌ NOT implemented yet
+```
+
+Do not implement recovery before understanding the ownership/lease semantics.
+
+---
+
+# 47. Updated Roadmap
 
 ```text
 1. Stable eventId                         [✅ Completed]
 2. Replay using same eventId              [✅ Completed]
-3. Concurrent duplicate race              [⏳ Next]
-4. UNIQUE(event_id) as atomic guard        [⏳ Next]
-5. Inbox / Processed Message pattern       [⏳ Upcoming]
-6. Provider-side idempotency               [⏳ Upcoming]
-7. Producer DB → Kafka failure window      [⏳ Upcoming]
-8. Transactional Outbox                    [⏳ Upcoming]
-9. Multiple partitions                     [⏳ Upcoming]
-10. Multiple consumer instances            [⏳ Upcoming]
-11. Rebalancing                            [⏳ Upcoming]
-12. Multi-broker / replicas / ISR          [⏳ Upcoming]
-13. OpenSearch read model                  [⏳ Upcoming]
+3. Concurrent duplicate race              [✅ Completed]
+4. UNIQUE(event_id) DB protection         [✅ Completed]
+5. Atomic Inbox claim                     [✅ Completed]
+6. Concurrent claim verification          [✅ Completed]
+7. PROCESSING / COMPLETED lifecycle        [✅ Completed]
+8. Crash after claim before email          [✅ Reproduced]
+9. Stuck PROCESSING verification           [✅ Completed]
+
+10. Stale claim / lease recovery           [⏳ NEXT]
+11. FAILED / retry ownership semantics      [⏳ Upcoming]
+12. External provider idempotency           [⏳ Upcoming]
+13. Producer DB → Kafka failure window      [⏳ Upcoming]
+14. Transactional Outbox                    [⏳ Upcoming]
+15. Multiple partitions                     [⏳ Upcoming]
+16. Multiple consumer instances             [⏳ Upcoming]
+17. Consumer-group rebalancing              [⏳ Upcoming]
+18. Multi-broker / replicas / ISR           [⏳ Upcoming]
+19. OpenSearch read model                   [⏳ Upcoming]
 ```
 
 ---
 
-# 27. Learning Principle
+# 48. Current Learning Principle
 
-Continue using the same approach:
+The POC continues to follow:
 
 ```text
-Build
-  ↓
-Break intentionally
-  ↓
-Observe actual behavior
-  ↓
-Ask why
-  ↓
-Introduce the pattern
-  ↓
-Retest
+Create a realistic failure
+        ↓
+observe the actual state
+        ↓
+verify using logs + Kafka + PostgreSQL + Mailpit
+        ↓
+understand why the current design failed
+        ↓
+make one architectural improvement
+        ↓
+break the improved design again
 ```
 
-Do not add a distributed-systems pattern only because it is considered a best practice.
+The current unresolved failure is deliberately preserved:
 
-First reproduce the problem that the pattern is intended to solve.
+```text
+status = PROCESSING
+claimed_at != NULL
+completed_at = NULL
+```
+
+The next stage begins by deciding when that claim is safe to recover.
