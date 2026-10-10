@@ -30,10 +30,19 @@ public class KafkaErrorHandlerConfig {
     public DefaultErrorHandler kafkaErrorHandler(
             DeadLetterPublishingRecoverer recoverer) {
 
+        ExponentialJitterBackOff backOff =
+                new ExponentialJitterBackOff(
+                        2000L,  // initial 2 sec
+                        2.0,    // exponential multiplier
+                        8000L,  // max delay 8 sec
+                        4,      // max 4 retries
+                        0.20    // +/- 20% jitter
+                );
+
         DefaultErrorHandler errorHandler =
                 new DefaultErrorHandler(
                         recoverer,
-                        new FixedBackOff(1000L, 2L)
+                        backOff
                 );
 
         errorHandler.addNotRetryableExceptions(

@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.LocalDateTime;
 import java.util.UUID;
 
 public interface InboxEventRepository
@@ -28,6 +29,27 @@ public interface InboxEventRepository
             @Param("eventType") String eventType
     );
 
+    boolean existsByEventIdAndStatus(
+            UUID eventId,
+            String status
+    );
+
+    @Modifying
+    @Query(
+            value = """
+                    UPDATE order_notification.inbox_events
+                    SET claimed_at = NOW()
+                    WHERE event_id = :eventId
+                      AND status = 'PROCESSING'
+                      AND claimed_at < :staleBefore
+                    """,
+            nativeQuery = true
+    )
+    int tryReclaim(
+            @Param("eventId") UUID eventId,
+            @Param("staleBefore") LocalDateTime staleBefore
+    );
+
     @Modifying
     @Query(
             value = """
@@ -35,6 +57,7 @@ public interface InboxEventRepository
                     SET status = 'COMPLETED',
                         completed_at = NOW()
                     WHERE event_id = :eventId
+                      AND status = 'PROCESSING'
                     """,
             nativeQuery = true
     )
