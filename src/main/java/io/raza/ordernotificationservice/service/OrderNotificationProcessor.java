@@ -1,9 +1,12 @@
 package io.raza.ordernotificationservice.service;
 
 import io.raza.ordernotificationservice.event.OrderPlacedEvent;
+import io.raza.ordernotificationservice.exception.NotificationTemporaryException;
 import io.raza.ordernotificationservice.notification.EmailNotificationService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+
+import java.time.LocalTime;
 
 @Service
 @RequiredArgsConstructor
@@ -14,41 +17,67 @@ public class OrderNotificationProcessor {
 
     public void process(OrderPlacedEvent event) {
 
-        boolean claimed =
-                inboxService.tryClaim(event);
+        ClaimResult claimResult =
+                inboxService.claim(event);
 
-        if (!claimed) {
+        System.out.println(
+                LocalTime.now()
+                        + " CLAIM RESULT"
+                        + " | eventId=" + event.eventId()
+                        + " | result=" + claimResult
+        );
+
+        if (claimResult == ClaimResult.COMPLETED) {
 
             System.out.println(
-                    Thread.currentThread().getName()
-                            + " EVENT ALREADY CLAIMED"
+                    "Duplicate completed event ignored"
                             + " | eventId=" + event.eventId()
             );
 
             return;
         }
 
-        System.out.println(
-                Thread.currentThread().getName()
-                        + " CLAIMED EVENT"
-                        + " | eventId=" + event.eventId()
-        );
-
-        if (event.productId().equals(5555L)) {
+        if (claimResult == ClaimResult.BUSY) {
 
             System.out.println(
-                    "SIMULATED CRASH AFTER CLAIM, BEFORE EMAIL"
+                    "Claim is still fresh. Retry later"
                             + " | eventId=" + event.eventId()
             );
 
-            throw new RuntimeException(
+            throw new NotificationTemporaryException(
+                    "Event is currently owned by another worker"
+            );
+        }
+
+        System.out.println(
+                Thread.currentThread().getName()
+                        + " OWNS EVENT"
+                        + " | result=" + claimResult
+                        + " | eventId=" + event.eventId()
+        );
+
+        /*
+         * 5555:
+         * crash only on the FIRST claim.
+         *
+         * On a later stale reclaim we allow processing to continue,
+         * otherwise this test would crash forever.
+         */
+        if (event.productId().equals(5555L)
+                && claimResult == ClaimResult.CLAIMED) {
+
+            System.out.println(
+                    "SIMULATED CRASH AFTER FIRST CLAIM, BEFORE EMAIL"
+                            + " | eventId=" + event.eventId()
+            );
+
+            throw new NotificationTemporaryException(
                     "Simulated crash after inbox claim before email"
             );
         }
 
-        // Keep this only for our concurrency experiment.
+        // Existing concurrency test if you still want to keep it.
         if (event.productId().equals(6666L)) {
-
             try {
                 Thread.sleep(2000);
             } catch (InterruptedException e) {
@@ -60,19 +89,15 @@ public class OrderNotificationProcessor {
         emailNotificationService.sendOrderPlacedEmail(event);
 
         System.out.println(
-                Thread.currentThread().getName()
+                LocalTime.now()
                         + " EMAIL SENT"
                         + " | eventId=" + event.eventId()
         );
 
-        // Keep our previous failure experiment.
+        // Existing crash-after-email test.
         if (event.productId().equals(7777L)) {
 
-            System.out.println(
-                    "CRASH AFTER EMAIL, BEFORE COMPLETION"
-            );
-
-            throw new RuntimeException(
+            throw new NotificationTemporaryException(
                     "Simulated crash after sending email"
             );
         }
@@ -80,7 +105,7 @@ public class OrderNotificationProcessor {
         inboxService.markCompleted(event);
 
         System.out.println(
-                Thread.currentThread().getName()
+                LocalTime.now()
                         + " EVENT COMPLETED"
                         + " | eventId=" + event.eventId()
         );

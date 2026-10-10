@@ -122,7 +122,7 @@ We deliberately kept:
 kafkaTemplate.send(
         "order-events",
         savedOrder.getId(),
-        event
+event
 );
 ```
 
@@ -215,7 +215,7 @@ Publishing remains:
 kafkaTemplate.send(
         "order-events",
         savedOrder.getId(),
-        event
+event
 );
 ```
 
@@ -434,14 +434,14 @@ Listener:
 ```java
 if (notificationService.isAlreadyProcessed(event.eventId())) {
 
-    System.out.println(
+        System.out.println(
             "Duplicate event ignored"
                     + " | eventId=" + event.eventId()
                     + " | orderId=" + event.orderId()
     );
 
-    return;
-}
+            return;
+            }
 ```
 
 After successful processing:
@@ -1138,7 +1138,7 @@ After the old duplicate check succeeded, the processor deliberately waited:
 
 ```java
 if (event.productId().equals(6666L)) {
-    Thread.sleep(2000);
+        Thread.sleep(2000);
 }
 ```
 
@@ -1488,16 +1488,16 @@ Processor logic conceptually became:
 boolean claimed = inboxService.tryClaim(event);
 
 if (!claimed) {
-    return;
-}
+        return;
+        }
 
-if (event.productId().equals(5555L)) {
-    throw new RuntimeException(
+        if (event.productId().equals(5555L)) {
+        throw new RuntimeException(
             "Simulated crash after inbox claim before email"
-    );
+);
 }
 
-emailNotificationService.sendOrderPlacedEmail(event);
+        emailNotificationService.sendOrderPlacedEmail(event);
 
 inboxService.markCompleted(event);
 ```
@@ -1674,45 +1674,1167 @@ The system currently has no recovery rule for that state.
 
 ---
 
-# 42. Next Architectural Question — NOT FIXED YET
+---
 
-The next problem to solve is:
+# 42. Why a Stale Claim / Lease Was Needed
 
-> How can another worker safely recover an event that is still `PROCESSING` because the original worker crashed?
+We had already fixed the concurrent duplicate problem with an atomic Inbox claim.
 
-We need to distinguish:
-
-```text
-COMPLETED
-    → true duplicate
-    → ignore safely
-
-PROCESSING + recent claim
-    → another worker may still be actively processing
-    → should not steal immediately
-
-PROCESSING + stale/old claim
-    → original worker probably crashed
-    → should become eligible for recovery/reclaim
-```
-
-This naturally leads to concepts such as:
+That flow was:
 
 ```text
-claim timeout
-lease expiration
-stale-claim detection
-retry ownership
-FAILED / retryable status
+event arrives
+    ↓
+try to INSERT inbox row
+    |
+    ├── INSERT succeeds
+    |      ↓
+    |   this worker owns event
+    |
+    └── conflict
+           ↓
+       another worker already owns / processed it
 ```
 
-No stale-claim recovery has been implemented yet.
+That solved:
 
-That is the next POC stage.
+```text
+two workers
+→ both process same event
+→ two emails
+```
+
+However, the `5555` test exposed a new failure window:
+
+```text
+claim event ✅
+status = PROCESSING
+      ↓
+application crashes ❌
+      ↓
+email was never sent
+      ↓
+completed_at stays NULL
+```
+
+The Inbox row remained:
+
+```text
+status       = PROCESSING
+claimed_at   = old timestamp
+completed_at = NULL
+```
+
+The important lesson was:
+
+```text
+"row exists"
+DOES NOT mean
+"processing completed"
+```
+
+A `PROCESSING` row can also mean:
+
+```text
+"The worker that owned this event crashed."
+```
+
+So we needed a way to decide when an old claim is safe to take over.
 
 ---
 
-# 43. Updated Failure Simulation IDs
+# 43. Simple Mental Model — Claim as a Temporary Lease
+
+Instead of thinking:
+
+```text
+PROCESSING = permanently owned
+```
+
+we changed the model to:
+
+```text
+PROCESSING = temporarily owned
+```
+
+Example:
+
+```text
+claim timeout = 5 seconds
+
+Worker A claims at:
+10:00:00
+
+At 10:00:02:
+claim age = 2 sec
+→ still fresh
+→ do not steal
+
+At 10:00:06:
+claim age = 6 sec
+→ stale
+→ original worker probably crashed
+→ another worker may try to reclaim
+```
+
+Pseudo-code:
+
+```text
+if no row:
+    claim event
+
+else if status == COMPLETED:
+    duplicate
+    ignore
+
+else if status == PROCESSING and claim is fresh:
+    BUSY
+    retry later
+
+else if status == PROCESSING and claim is stale:
+    try atomic reclaim
+```
+
+---
+
+# 44. Question: What If All Retries Happen Before the Lease Expires?
+
+This was an important design question.
+
+Suppose:
+
+```text
+claim lease = 10 seconds
+```
+
+but Kafka retry policy is:
+
+```text
+attempt 1 → 0 sec
+retry 1   → 1 sec
+retry 2   → 2 sec
+stop
+```
+
+Then every retry happens while the claim is still fresh:
+
+```text
+0 sec  → PROCESSING fresh
+1 sec  → PROCESSING fresh
+2 sec  → PROCESSING fresh
+10 sec → finally stale
+         but no retries remain ❌
+```
+
+So:
+
+```text
+claim timeout
+and
+retry schedule
+```
+
+must be designed together.
+
+The retry window must extend beyond the lease timeout.
+
+---
+
+# 45. Why We Chose Exponential Backoff + Jitter
+
+Our old retry was fixed:
+
+```java
+new FixedBackOff(1000L, 2L)
+```
+
+Meaning roughly:
+
+```text
+retry after 1 sec
+retry after another 1 sec
+then stop
+```
+
+That is simple, but not ideal for a lease-based recovery strategy.
+
+We changed the idea to:
+
+```text
+Exponential Backoff
++
+Jitter
+```
+
+Example base delays:
+
+```text
+2 sec
+4 sec
+8 sec
+```
+
+With ±20% jitter, an actual run may become:
+
+```text
+1.7 sec
+3.9 sec
+7.5 sec
+```
+
+Why exponential?
+
+```text
+failure continues
+    ↓
+wait longer before next attempt
+    ↓
+give system/dependency time to recover
+```
+
+Why jitter?
+
+Imagine 100 consumers fail at the same time.
+
+Without jitter:
+
+```text
+100 retry at 2 sec
+100 retry again at 6 sec
+100 retry again at 14 sec
+```
+
+This can create retry spikes.
+
+With jitter:
+
+```text
+some retry at 1.7 sec
+some retry at 2.1 sec
+some retry at 2.3 sec
+...
+```
+
+The retries are spread out.
+
+---
+
+# 46. POC Timing Decision
+
+For learning we intentionally kept the timings short:
+
+```text
+Inbox lease timeout = 5 seconds
+
+Retry base delay:
+2 sec
+4 sec
+8 sec ...
+
+Jitter:
+±20%
+```
+
+This lets us clearly observe:
+
+```text
+CLAIMED
+   ↓
+BUSY
+   ↓
+RECLAIMED
+```
+
+without waiting minutes.
+
+Production values would normally be chosen based on the real processing time, downstream API behavior, and operational requirements.
+
+---
+
+# 47. Claim Result Model
+
+We introduced a small enum so the processor can understand the exact Inbox state.
+
+```java
+public enum ClaimResult {
+    CLAIMED,
+    RECLAIMED,
+    COMPLETED,
+    BUSY
+}
+```
+
+Meaning:
+
+```text
+CLAIMED
+= no row existed
+= I created the PROCESSING row
+= I own this event
+
+RECLAIMED
+= a stale PROCESSING row existed
+= I atomically took ownership
+
+COMPLETED
+= the event already completed successfully
+= true duplicate
+= ignore it
+
+BUSY
+= a fresh PROCESSING claim exists
+= another worker may still be active
+= retry later
+```
+
+Pseudo-code:
+
+```text
+result = claim(event)
+
+switch result:
+
+    CLAIMED:
+        process
+
+    RECLAIMED:
+        process
+
+    COMPLETED:
+        return
+
+    BUSY:
+        throw retryable exception
+```
+
+---
+
+# 48. Why `BUSY` Must NOT Return Normally
+
+This was another important point.
+
+Bad behavior:
+
+```java
+if (claimResult == BUSY) {
+    return;
+}
+```
+
+Why is this dangerous?
+
+Spring Kafka sees:
+
+```text
+listener returned normally
+→ processing succeeded
+```
+
+and may advance the consumer offset.
+
+But the business operation is not complete.
+
+Correct behavior:
+
+```java
+if (claimResult == BUSY) {
+    throw new NotificationTemporaryException(
+        "Event is currently owned by another worker"
+    );
+}
+```
+
+Now Spring Kafka sees:
+
+```text
+listener failed temporarily
+→ retry later
+```
+
+Pseudo flow:
+
+```text
+PROCESSING + fresh
+      ↓
+BUSY
+      ↓
+throw retryable exception
+      ↓
+Kafka keeps same offset
+      ↓
+retry later
+```
+
+---
+
+# 49. Atomic Native Query #1 — First Claim
+
+The first claim is done with one PostgreSQL-native SQL statement:
+
+```sql
+INSERT INTO order_notification.inbox_events
+    (event_id, order_id, event_type, status, claimed_at)
+VALUES
+    (:eventId, :orderId, :eventType, 'PROCESSING', NOW())
+ON CONFLICT (event_id) DO NOTHING;
+```
+
+Repository idea:
+
+```java
+@Modifying
+@Query(
+    value = """
+        INSERT INTO order_notification.inbox_events
+            (event_id, order_id, event_type, status, claimed_at)
+        VALUES
+            (:eventId, :orderId, :eventType, 'PROCESSING', NOW())
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+    nativeQuery = true
+)
+int tryClaim(...);
+```
+
+## Why `nativeQuery = true`?
+
+Because this is real PostgreSQL SQL.
+
+The important PostgreSQL-specific part is:
+
+```sql
+ON CONFLICT (event_id) DO NOTHING
+```
+
+JPQL does not support this syntax directly.
+
+So:
+
+```text
+nativeQuery = true
+```
+
+means:
+
+```text
+"Send this SQL directly to PostgreSQL."
+```
+
+## Why return `int`?
+
+The returned integer is the number of rows affected.
+
+```text
+1
+→ insert happened
+→ claim succeeded
+
+0
+→ event_id already existed
+→ no insert happened
+```
+
+That gives us an atomic winner decision.
+
+---
+
+# 50. Dry Run — `INSERT ... ON CONFLICT DO NOTHING`
+
+Suppose both workers receive:
+
+```text
+eventId = ABC
+```
+
+at almost the same time.
+
+Initial database:
+
+```text
+inbox_events
+= no ABC row
+```
+
+### Worker A
+
+Runs:
+
+```sql
+INSERT ... event_id = ABC
+ON CONFLICT DO NOTHING;
+```
+
+PostgreSQL inserts:
+
+```text
+ABC | PROCESSING
+```
+
+Return:
+
+```text
+affected rows = 1
+```
+
+Worker A knows:
+
+```text
+I OWN THE EVENT
+```
+
+### Worker B
+
+Also runs:
+
+```sql
+INSERT ... event_id = ABC
+ON CONFLICT DO NOTHING;
+```
+
+But PostgreSQL now sees:
+
+```text
+ABC already exists
+```
+
+Because `event_id` is unique / primary key.
+
+So PostgreSQL performs:
+
+```text
+DO NOTHING
+```
+
+Return:
+
+```text
+affected rows = 0
+```
+
+Worker B knows:
+
+```text
+I DO NOT OWN THE EVENT
+```
+
+Result:
+
+```text
+Worker A → claim won
+Worker B → claim lost
+
+Only Worker A reaches email
+```
+
+This is atomic because the database performs:
+
+```text
+check conflict + insert decision
+```
+
+inside one SQL operation.
+
+There is no application gap like:
+
+```text
+SELECT exists?
+     ↓
+some time passes
+     ↓
+INSERT
+```
+
+---
+
+# 51. Atomic Native Query #2 — Stale Reclaim
+
+For an existing `PROCESSING` row we added an atomic reclaim:
+
+```sql
+UPDATE order_notification.inbox_events
+SET claimed_at = NOW()
+WHERE event_id = :eventId
+  AND status = 'PROCESSING'
+  AND claimed_at < :staleBefore;
+```
+
+Here:
+
+```text
+staleBefore
+= current time - claim timeout
+```
+
+Example:
+
+```text
+current time = 10:00:10
+lease        = 5 sec
+
+staleBefore = 10:00:05
+```
+
+A claim from:
+
+```text
+10:00:02
+```
+
+is older than:
+
+```text
+10:00:05
+```
+
+so it is stale.
+
+A claim from:
+
+```text
+10:00:08
+```
+
+is newer than:
+
+```text
+10:00:05
+```
+
+so it is fresh.
+
+---
+
+# 52. Dry Run — Atomic Stale Reclaim
+
+Database currently contains:
+
+```text
+event_id   = ABC
+status     = PROCESSING
+claimed_at = 10:00:00
+```
+
+Current time:
+
+```text
+10:00:10
+```
+
+Lease timeout:
+
+```text
+5 sec
+```
+
+Therefore:
+
+```text
+staleBefore = 10:00:05
+```
+
+Condition:
+
+```sql
+claimed_at < '10:00:05'
+```
+
+Current row has:
+
+```text
+10:00:00 < 10:00:05
+```
+
+So the row is stale.
+
+Now imagine Worker B and Worker C both try to reclaim ABC.
+
+## Worker B
+
+Runs:
+
+```sql
+UPDATE inbox_events
+SET claimed_at = NOW()
+WHERE event_id = 'ABC'
+  AND status = 'PROCESSING'
+  AND claimed_at < '10:00:05';
+```
+
+Condition matches.
+
+PostgreSQL changes:
+
+```text
+claimed_at:
+10:00:00
+→
+10:00:10
+```
+
+Return:
+
+```text
+affected rows = 1
+```
+
+Worker B gets:
+
+```text
+RECLAIMED
+```
+
+## Worker C
+
+Runs the same statement.
+
+But now the row contains:
+
+```text
+claimed_at = 10:00:10
+```
+
+Condition becomes:
+
+```text
+10:00:10 < 10:00:05
+```
+
+which is false.
+
+Return:
+
+```text
+affected rows = 0
+```
+
+Worker C does NOT own the event.
+
+Result:
+
+```text
+many workers may try to reclaim
+        ↓
+PostgreSQL update condition chooses one winner
+```
+
+This is why the stale reclaim is also atomic.
+
+---
+
+# 53. Claim Algorithm After Lease Support
+
+Simple pseudo-code:
+
+```text
+claim(event):
+
+    inserted = try INSERT event
+
+    if inserted == 1:
+        return CLAIMED
+
+
+    if status == COMPLETED:
+        return COMPLETED
+
+
+    staleBefore = now - leaseTimeout
+
+    reclaimed = try atomic UPDATE
+
+    if reclaimed == 1:
+        return RECLAIMED
+
+
+    if status became COMPLETED meanwhile:
+        return COMPLETED
+
+
+    return BUSY
+```
+
+The second COMPLETED check is useful because another worker could finish while this worker is deciding what to do.
+
+---
+
+# 54. Why We Used `REQUIRES_NEW`
+
+The claim operation uses its own database transaction:
+
+```java
+@Transactional(
+    propagation = Propagation.REQUIRES_NEW
+)
+```
+
+Reason:
+
+We want the ownership claim to commit independently before the external email call starts.
+
+Pseudo flow:
+
+```text
+BEGIN claim transaction
+      ↓
+INSERT / RECLAIM
+      ↓
+COMMIT
+      ↓
+claim visible to other workers
+      ↓
+send email
+```
+
+If the application crashes during the email call, the Inbox claim still exists.
+
+That is exactly what lets another worker later detect:
+
+```text
+PROCESSING + stale
+```
+
+and recover it.
+
+---
+
+# 55. Exponential Backoff + Jitter Configuration
+
+We replaced fixed retry timing with an exponential+jitter strategy.
+
+POC configuration:
+
+```text
+initial interval = 2 seconds
+multiplier       = 2
+max interval     = 8 seconds
+max retries      = 4
+jitter           = ±20%
+```
+
+Pseudo timing:
+
+```text
+base:
+2 sec
+4 sec
+8 sec
+8 sec
+
+actual with jitter:
+~1.6–2.4 sec
+~3.2–4.8 sec
+~6.4–9.6 sec
+...
+```
+
+Important:
+
+Jitter means the exact retry time changes every run.
+
+That is expected.
+
+---
+
+# 56. Question: Will Jitter Make the POC Hard to Observe?
+
+No.
+
+We added logging such as:
+
+```text
+Kafka retry scheduled
+| retry=1
+| delayMs=1707
+```
+
+So instead of predicting the exact time, we observe the actual delay selected.
+
+This lets us clearly see:
+
+```text
+retry delay
+claim age
+claim result
+```
+
+for each attempt.
+
+---
+
+# 57. `5555` Recovery Test — Actual Result
+
+We created a NEW event using:
+
+```text
+productId = 5555
+```
+
+Actual Kafka record:
+
+```text
+eventId =
+a690a5ce-edf6-4e7d-95e3-e3f5ced58027
+
+key      = 17
+partition= 0
+offset   = 14
+orderId  = 17
+```
+
+The actual flow was:
+
+```text
+02:48:58.098
+CLAIM RESULT = CLAIMED
+
+SIMULATED CRASH
+after first claim
+before email
+```
+
+Retry scheduler chose:
+
+```text
+retry #1
+delay = 1707 ms
+```
+
+Next attempt:
+
+```text
+02:49:00.024
+CLAIM RESULT = BUSY
+```
+
+Interpretation:
+
+```text
+claim age ≈ 1.9 sec
+
+lease = 5 sec
+
+1.9 < 5
+→ still fresh
+→ do not steal
+```
+
+The processor threw a retryable exception again.
+
+Next retry scheduler chose:
+
+```text
+retry #2
+delay = 3898 ms
+```
+
+Next attempt:
+
+```text
+02:49:03.985
+CLAIM RESULT = RECLAIMED
+```
+
+Interpretation:
+
+```text
+original claim age ≈ 5.9 sec
+
+5.9 > 5 sec lease
+→ stale
+→ atomic reclaim succeeds
+```
+
+Then:
+
+```text
+02:49:04.050
+EMAIL SENT ✅
+
+02:49:04.052
+EVENT COMPLETED ✅
+```
+
+---
+
+# 58. Actual Timeline Diagram
+
+```text
+02:48:58
+Kafka offset 14 arrives
+        ↓
+CLAIMED
+        ↓
+status = PROCESSING
+        ↓
+SIMULATED CRASH
+before email
+        ↓
+
+retry delay = 1707 ms
+
+        ↓
+02:49:00
+same offset 14
+same eventId
+        ↓
+claim age ≈ 1.9 sec
+        ↓
+BUSY
+        ↓
+throw retryable exception
+        ↓
+
+retry delay = 3898 ms
+
+        ↓
+02:49:03
+same offset 14
+same eventId
+        ↓
+claim age ≈ 5.9 sec
+        ↓
+lease expired
+        ↓
+atomic RECLAIM
+        ↓
+RECLAIMED
+        ↓
+send email
+        ↓
+mark COMPLETED
+```
+
+Result:
+
+```text
+1 Kafka event
+1 final email
+1 COMPLETED Inbox row
+```
+
+---
+
+# 59. What We Solved
+
+We have now solved this failure:
+
+```text
+event claimed
+      ↓
+worker crashes BEFORE email
+      ↓
+row stuck PROCESSING
+```
+
+New behavior:
+
+```text
+fresh PROCESSING
+→ BUSY
+→ retry later
+
+stale PROCESSING
+→ atomic reclaim
+→ continue processing
+```
+
+So a crashed worker no longer leaves the event permanently stuck.
+
+---
+
+# 60. Important Remaining Failure Window
+
+There is still a harder problem.
+
+Suppose:
+
+```text
+CLAIMED
+    ↓
+EMAIL SENT ✅
+    ↓
+APPLICATION CRASHES ❌
+    ↓
+markCompleted() never happens
+```
+
+Database still contains:
+
+```text
+status = PROCESSING
+```
+
+Later:
+
+```text
+lease expires
+    ↓
+event becomes stale
+    ↓
+another worker RECLAIMS
+    ↓
+EMAIL SENT AGAIN ❌
+```
+
+So stale-claim recovery solves:
+
+```text
+crash BEFORE email
+```
+
+but it does NOT guarantee exactly-once external side effects when the crash occurs:
+
+```text
+AFTER email
+BEFORE DB completion update
+```
+
+This is our CURRENT unresolved architectural problem.
+
+---
+
+# 61. Question: Isn't the Email Already Successful?
+
+Yes.
+
+The problem is that our database does not know that.
+
+Timeline:
+
+```text
+Mail server accepted email ✅
+        ↓
+application crashes
+        ↓
+database still says PROCESSING
+```
+
+Later the recovery logic only sees:
+
+```text
+PROCESSING + stale
+```
+
+It cannot know whether:
+
+```text
+email never happened
+```
+
+or:
+
+```text
+email happened successfully
+but completion marker was never written
+```
+
+Those two situations look identical from the Inbox database.
+
+That is why exactly-once external side effects are harder than exactly-once database state.
+
+---
+
+# 62. Current Failure Simulation IDs
 
 | Product ID | Purpose |
 |---:|---|
@@ -1721,176 +2843,239 @@ That is the next POC stage.
 | `8888` | Non-retryable invalid event |
 | `7777` | Email succeeds, crash before completion marker |
 | `6666` | Widen concurrency window for duplicate race |
-| `5555` | Claim succeeds, crash BEFORE email |
+| `5555` | First claim crashes BEFORE email, then stale claim recovery is tested |
 
 ---
 
-# 44. Updated Architecture
+# 63. Current Architecture
 
 ```text
-Client
-  |
-  | POST /api/orders
-  v
-order-event-service
-  |
-  +---- PostgreSQL
-  |       order_event.orders
-  |
-  +---- create stable eventId
-  |
-  +---- KafkaTemplate
-           |
-           | key = orderId
-           v
-      order-events
-           |
-           v
- order-notification-service
-           |
-           v
-      Inbox atomic claim
-           |
-           | INSERT ... ON CONFLICT DO NOTHING
-           |
-       +---+----------------------+
-       |                          |
-       | claim won                | claim lost
-       v                          v
- status=PROCESSING              return
-       |
-       v
- send email
-       |
-       v
- mark COMPLETED
-       |
-       v
- completed_at set
-
-Failure discovered:
-
-PROCESSING
+Kafka event
+    ↓
+Inbox claim(eventId)
     |
-    X crash before email
+    ├── no row
+    |      ↓
+    |   CLAIMED
     |
-    v
-stuck PROCESSING row
+    ├── COMPLETED
+    |      ↓
+    |   true duplicate
+    |      ↓
+    |   ignore
+    |
+    └── PROCESSING
+           |
+           ├── fresh
+           |      ↓
+           |   BUSY
+           |      ↓
+           |   retry later
+           |
+           └── stale
+                  ↓
+             atomic UPDATE
+                  |
+                  ├── won
+                  |    ↓
+                  | RECLAIMED
+                  |
+                  └── lost
+                       ↓
+                     BUSY
+
+CLAIMED / RECLAIMED
+        ↓
+send email
+        ↓
+mark COMPLETED
 ```
 
 ---
 
-# 45. What We Have Proven in Part 2 So Far
+# 64. What We Have Proven in Part 2 So Far
 
 ```text
-✅ Stable eventId is better than using orderId as exact message identity
+✅ Stable eventId separates message identity from order identity
 
-✅ Same Kafka replay carries the same eventId
+✅ Same Kafka replay carries same eventId
 
-✅ eventId-based replay deduplication works after successful processing
+✅ eventId-based replay deduplication works
 
-✅ exists() → act → insert() is NOT concurrency-safe
+✅ exists() → act → insert() has a race
 
-✅ Two concurrent workers can both pass exists() == false
+✅ Two threads can both pass exists() == false
 
-✅ UNIQUE(event_id) protects DB state but cannot undo duplicate emails
+✅ UNIQUE(event_id) protects DB but cannot undo duplicate email
 
-✅ Atomic INSERT ... ON CONFLICT can establish one owner
+✅ Atomic INSERT ... ON CONFLICT establishes one owner
 
-✅ Atomic Inbox claim reduced concurrent duplicate side effect:
+✅ Atomic claim changed:
    2 emails → 1 email
+   during concurrent processing
 
-✅ PROCESSING / COMPLETED lifecycle is necessary
+✅ PROCESSING / COMPLETED lifecycle introduced
 
-✅ Claim-first design has its own crash window
+✅ Crash after claim before email reproduced
 
-✅ productId=5555 reproduced:
-   claim persisted
-   email never completed
-   status stuck at PROCESSING
+✅ Stuck PROCESSING row verified
 
-✅ Database verification confirmed:
-   claimed_at populated
-   completed_at NULL
+✅ Claim treated as temporary lease
 
-✅ "event row exists" does NOT mean "event completed"
+✅ Fresh PROCESSING returns BUSY
+
+✅ BUSY throws retryable exception instead of returning success
+
+✅ Stale PROCESSING can be atomically reclaimed
+
+✅ Lease timeout and retry schedule must be designed together
+
+✅ Exponential backoff added
+
+✅ Jitter added
+
+✅ Actual retry delay logging verified
+
+✅ CLAIMED → BUSY → RECLAIMED flow observed
+
+✅ Crash before email successfully recovered
+
+✅ One final email sent
+
+✅ Event ended COMPLETED
+
+❌ Crash after successful email but before COMPLETED
+   can still cause duplicate external side effect
 ```
 
 ---
 
-# 46. Current Checkpoint
+# 65. Current Checkpoint
 
 We are currently HERE:
 
 ```text
-Atomic claim             ✅ implemented
-Concurrent duplicate fix ✅ verified
-Inbox PROCESSING state   ✅ implemented
-Inbox COMPLETED state    ✅ implemented
+Atomic first claim                  ✅
+Concurrent duplicate protection     ✅
+PROCESSING / COMPLETED              ✅
+Stale claim detection               ✅
+Atomic stale reclaim                ✅
+Exponential retry                   ✅
+Jitter                              ✅
+Crash-before-email recovery         ✅
 
-Crash after claim
-before email             ✅ reproduced
-
-Stuck PROCESSING row     ✅ verified
-
-Stale claim recovery     ❌ NOT implemented yet
+Crash-after-email
+before DB completion                ❌ still unresolved
 ```
-
-Do not implement recovery before understanding the ownership/lease semantics.
 
 ---
 
-# 47. Updated Roadmap
+# 66. Next Architectural Question
+
+The next problem is:
+
+> How do we prevent duplicate external side effects when the external provider succeeded, but our application crashed before saving `COMPLETED`?
+
+Example:
+
+```text
+email accepted by provider ✅
+        ↓
+app crashes ❌
+        ↓
+Inbox stays PROCESSING
+        ↓
+lease expires
+        ↓
+event reclaimed
+        ↓
+email sent again ❌
+```
+
+This leads naturally to:
+
+```text
+provider-side idempotency keys
+external operation IDs
+side-effect-specific deduplication
+```
+
+The next stage should first reproduce this behavior again under the new lease/reclaim architecture, then introduce the appropriate external-idempotency solution.
+
+---
+
+# 67. Updated Roadmap
 
 ```text
 1. Stable eventId                         [✅ Completed]
 2. Replay using same eventId              [✅ Completed]
 3. Concurrent duplicate race              [✅ Completed]
 4. UNIQUE(event_id) DB protection         [✅ Completed]
-5. Atomic Inbox claim                     [✅ Completed]
+5. Atomic Inbox first claim               [✅ Completed]
 6. Concurrent claim verification          [✅ Completed]
 7. PROCESSING / COMPLETED lifecycle        [✅ Completed]
 8. Crash after claim before email          [✅ Reproduced]
 9. Stuck PROCESSING verification           [✅ Completed]
+10. Lease / stale-claim model              [✅ Completed]
+11. Atomic stale reclaim                   [✅ Completed]
+12. Exponential retry                      [✅ Completed]
+13. Retry jitter                           [✅ Completed]
+14. Crash-before-email recovery test       [✅ Completed]
 
-10. Stale claim / lease recovery           [⏳ NEXT]
-11. FAILED / retry ownership semantics      [⏳ Upcoming]
-12. External provider idempotency           [⏳ Upcoming]
-13. Producer DB → Kafka failure window      [⏳ Upcoming]
-14. Transactional Outbox                    [⏳ Upcoming]
-15. Multiple partitions                     [⏳ Upcoming]
-16. Multiple consumer instances             [⏳ Upcoming]
-17. Consumer-group rebalancing              [⏳ Upcoming]
-18. Multi-broker / replicas / ISR           [⏳ Upcoming]
-19. OpenSearch read model                   [⏳ Upcoming]
+15. Crash-after-email duplicate recovery   [⏳ NEXT]
+16. Provider-side idempotency              [⏳ Upcoming]
+17. FAILED / operational retry semantics   [⏳ Upcoming]
+18. Producer DB → Kafka failure window     [⏳ Upcoming]
+19. Transactional Outbox                   [⏳ Upcoming]
+20. Multiple partitions                    [⏳ Upcoming]
+21. Multiple consumer instances            [⏳ Upcoming]
+22. Consumer-group rebalancing             [⏳ Upcoming]
+23. Multi-broker / replicas / ISR          [⏳ Upcoming]
+24. OpenSearch read model                  [⏳ Upcoming]
 ```
 
 ---
 
-# 48. Current Learning Principle
+# 68. Revision Summary
 
-The POC continues to follow:
-
-```text
-Create a realistic failure
-        ↓
-observe the actual state
-        ↓
-verify using logs + Kafka + PostgreSQL + Mailpit
-        ↓
-understand why the current design failed
-        ↓
-make one architectural improvement
-        ↓
-break the improved design again
-```
-
-The current unresolved failure is deliberately preserved:
+If revisiting this stage later, remember these four steps:
 
 ```text
-status = PROCESSING
-claimed_at != NULL
-completed_at = NULL
+Problem 1:
+two consumers both see "not processed"
+→ fixed with atomic INSERT claim
+
+Problem 2:
+worker crashes after claim before email
+→ claim becomes stale
+→ fixed with lease + atomic reclaim
+
+Problem 3:
+all retries happen before lease expires
+→ fixed by retry policy that extends beyond lease timeout
+
+Retry quality:
+fixed retry
+→ changed to exponential + jitter
+
+Still unresolved:
+email succeeds but DB completion update does not
 ```
 
-The next stage begins by deciding when that claim is safe to recover.
+The atomic SQL principle to remember is:
+
+```text
+Do not:
+
+SELECT
+then decide in Java
+then UPDATE/INSERT
+
+when ownership must be exclusive.
+
+Prefer:
+
+one conditional INSERT/UPDATE
+and use affected-row count
+to know who won.
+```
