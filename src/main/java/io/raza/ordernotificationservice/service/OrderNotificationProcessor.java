@@ -9,31 +9,45 @@ import org.springframework.stereotype.Service;
 @RequiredArgsConstructor
 public class OrderNotificationProcessor {
 
-    private final NotificationService notificationService;
+    private final InboxService inboxService;
     private final EmailNotificationService emailNotificationService;
 
     public void process(OrderPlacedEvent event) {
 
-        if (notificationService.isAlreadyProcessed(event.eventId())) {
+        boolean claimed =
+                inboxService.tryClaim(event);
+
+        if (!claimed) {
+
             System.out.println(
-                    "Duplicate ignored"
+                    Thread.currentThread().getName()
+                            + " EVENT ALREADY CLAIMED"
                             + " | eventId=" + event.eventId()
-                            + " | orderId=" + event.orderId()
             );
+
             return;
         }
 
-        /*
-         * TEMPORARY FOR CONCURRENCY TEST.
-         *
-         * Gives two threads enough time to both pass the
-         * existsByEventId() check before either inserts.
-         */
-        if (event.productId().equals(6666L)) {
+        System.out.println(
+                Thread.currentThread().getName()
+                        + " CLAIMED EVENT"
+                        + " | eventId=" + event.eventId()
+        );
+
+        if (event.productId().equals(5555L)) {
+
             System.out.println(
-                    Thread.currentThread().getName()
-                            + " passed duplicate check. Waiting..."
+                    "SIMULATED CRASH AFTER CLAIM, BEFORE EMAIL"
+                            + " | eventId=" + event.eventId()
             );
+
+            throw new RuntimeException(
+                    "Simulated crash after inbox claim before email"
+            );
+        }
+
+        // Keep this only for our concurrency experiment.
+        if (event.productId().equals(6666L)) {
 
             try {
                 Thread.sleep(2000);
@@ -51,11 +65,23 @@ public class OrderNotificationProcessor {
                         + " | eventId=" + event.eventId()
         );
 
-        notificationService.markAsProcessed(event);
+        // Keep our previous failure experiment.
+        if (event.productId().equals(7777L)) {
+
+            System.out.println(
+                    "CRASH AFTER EMAIL, BEFORE COMPLETION"
+            );
+
+            throw new RuntimeException(
+                    "Simulated crash after sending email"
+            );
+        }
+
+        inboxService.markCompleted(event);
 
         System.out.println(
                 Thread.currentThread().getName()
-                        + " DB MARKER SAVED"
+                        + " EVENT COMPLETED"
                         + " | eventId=" + event.eventId()
         );
     }
