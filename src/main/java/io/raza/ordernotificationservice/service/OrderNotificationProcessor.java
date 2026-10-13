@@ -1,5 +1,6 @@
 package io.raza.ordernotificationservice.service;
 
+import io.raza.ordernotificationservice.client.EmailProviderClient;
 import io.raza.ordernotificationservice.event.OrderPlacedEvent;
 import io.raza.ordernotificationservice.exception.NotificationTemporaryException;
 import io.raza.ordernotificationservice.notification.EmailNotificationService;
@@ -13,7 +14,8 @@ import java.time.LocalTime;
 public class OrderNotificationProcessor {
 
     private final InboxService inboxService;
-    private final EmailNotificationService emailNotificationService;
+   // private final EmailNotificationService emailNotificationService;
+    private final EmailProviderClient emailProviderClient;
 
     public void process(OrderPlacedEvent event) {
 
@@ -86,19 +88,25 @@ public class OrderNotificationProcessor {
             }
         }
 
-        emailNotificationService.sendOrderPlacedEmail(event);
+      //  emailNotificationService.sendOrderPlacedEmail(event);
+        emailProviderClient.sendOrderPlacedEmail(event);
 
         System.out.println(
                 LocalTime.now()
-                        + " EMAIL SENT"
+                        + " EMAIL PROVIDER SUCCESS"
                         + " | eventId=" + event.eventId()
         );
 
-        // Existing crash-after-email test.
-        if (event.productId().equals(7777L)) {
+        if (event.productId().equals(7777L)
+                && claimResult == ClaimResult.CLAIMED) {
+
+            System.out.println(
+                    "SIMULATED CRASH AFTER EMAIL, BEFORE COMPLETED"
+                            + " | eventId=" + event.eventId()
+            );
 
             throw new NotificationTemporaryException(
-                    "Simulated crash after sending email"
+                    "Simulated crash after email before DB completion"
             );
         }
 

@@ -2017,8 +2017,8 @@ Bad behavior:
 
 ```java
 if (claimResult == BUSY) {
-    return;
-}
+        return;
+        }
 ```
 
 Why is this dangerous?
@@ -2038,9 +2038,9 @@ Correct behavior:
 
 ```java
 if (claimResult == BUSY) {
-    throw new NotificationTemporaryException(
+        throw new NotificationTemporaryException(
         "Event is currently owned by another worker"
-    );
+);
 }
 ```
 
@@ -2084,14 +2084,14 @@ Repository idea:
 ```java
 @Modifying
 @Query(
-    value = """
-        INSERT INTO order_notification.inbox_events
-            (event_id, order_id, event_type, status, claimed_at)
-        VALUES
-            (:eventId, :orderId, :eventType, 'PROCESSING', NOW())
-        ON CONFLICT (event_id) DO NOTHING
-        """,
-    nativeQuery = true
+        value = """
+                INSERT INTO order_notification.inbox_events
+                    (event_id, order_id, event_type, status, claimed_at)
+                VALUES
+                    (:eventId, :orderId, :eventType, 'PROCESSING', NOW())
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+        nativeQuery = true
 )
 int tryClaim(...);
 ```
@@ -2463,7 +2463,7 @@ The claim operation uses its own database transaction:
 
 ```java
 @Transactional(
-    propagation = Propagation.REQUIRES_NEW
+        propagation = Propagation.REQUIRES_NEW
 )
 ```
 
@@ -3078,4 +3078,1714 @@ Prefer:
 one conditional INSERT/UPDATE
 and use affected-row count
 to know who won.
+```
+
+---
+
+# 69. Crash AFTER Email — We Reproduced the Remaining Failure
+
+After stale-claim recovery was working, we tested the harder case again with:
+
+```text
+productId = 7777
+```
+
+The test intentionally does:
+
+```text
+CLAIM event
+    ↓
+send email
+    ↓
+email succeeds
+    ↓
+CRASH before Inbox status becomes COMPLETED
+```
+
+Actual event:
+
+```text
+eventId   = 460d4f18-b702-4554-bee5-57cebff79d0c
+orderId   = 18
+partition = 0
+offset    = 15
+productId = 7777
+```
+
+Actual flow:
+
+```text
+03:29:35
+CLAIM RESULT = CLAIMED
+        ↓
+EMAIL SENT #1 ✅
+        ↓
+SIMULATED CRASH
+after email
+before COMPLETED
+```
+
+Then retry #1 happened after approximately:
+
+```text
+1895 ms
+```
+
+and produced:
+
+```text
+CLAIM RESULT = BUSY
+```
+
+The claim was still fresh, so we correctly did not steal it.
+
+Retry #2 happened after approximately:
+
+```text
+4417 ms
+```
+
+By then the 5-second lease was stale:
+
+```text
+CLAIM RESULT = RECLAIMED
+```
+
+The reclaimed worker then executed the business operation again:
+
+```text
+EMAIL SENT #2 ❌ duplicate
+        ↓
+EVENT COMPLETED ✅
+```
+
+Mailpit showed:
+
+```text
+2 emails
+```
+
+for one logical Kafka event.
+
+---
+
+# 70. Why Did Stale Recovery Cause a Duplicate Email?
+
+The stale-reclaim logic only knows what exists in our database.
+
+After a crash, it sees:
+
+```text
+status       = PROCESSING
+completed_at = NULL
+```
+
+But these TWO very different situations look exactly the same:
+
+```text
+Case A — crash BEFORE email
+
+CLAIMED
+    ↓
+CRASH
+    ↓
+email never sent
+
+DB:
+PROCESSING
+```
+
+and:
+
+```text
+Case B — crash AFTER email
+
+CLAIMED
+    ↓
+EMAIL SENT ✅
+    ↓
+CRASH
+    ↓
+COMPLETED never written
+
+DB:
+PROCESSING
+```
+
+The Inbox database cannot answer:
+
+```text
+"Did the external mail system already perform the side effect?"
+```
+
+So after the lease expires, it safely recovers the stuck work — but in Case B that means performing the external side effect again.
+
+Important lesson:
+
+```text
+Lease / stale reclaim
+solves crashed ownership
+
+but
+
+does NOT prove whether an external side effect
+already happened.
+```
+
+---
+
+# 71. Question: Wasn't the Email Already Successful?
+
+Yes.
+
+That is exactly the problem.
+
+Timeline:
+
+```text
+Mail server accepted email ✅
+        ↓
+notification service crashes ❌
+        ↓
+notification DB never writes COMPLETED
+```
+
+The notification service knows:
+
+```text
+PROCESSING
+```
+
+but the mail system knows:
+
+```text
+email already accepted
+```
+
+Those two systems do not share one atomic transaction.
+
+A PostgreSQL rollback/update cannot undo or inspect an already accepted SMTP email.
+
+---
+
+# 72. Architecture Decision — Move Idempotency to the Side-Effect Owner
+
+We decided the notification consumer should not be the final authority for whether an email was already sent.
+
+Instead, the system that performs the email side effect should receive a stable idempotency identity.
+
+For our POC:
+
+```text
+Idempotency-Key = Kafka eventId
+```
+
+New architecture:
+
+```text
+order-notification-service
+        |
+        | HTTP request
+        | Idempotency-Key = eventId
+        v
+mock-email-provider-service
+        |
+        | provider-side idempotency
+        v
+JavaMailSender
+        |
+        v
+Mailpit
+```
+
+Why `eventId`?
+
+Because every retry of the SAME Kafka event contains the SAME:
+
+```text
+eventId
+```
+
+Example:
+
+```text
+Kafka attempt 1:
+eventId = ABC
+
+Kafka retry:
+eventId = ABC
+
+Kafka reclaim:
+eventId = ABC
+```
+
+So all calls represent the same logical email operation.
+
+---
+
+# 73. Why We Created `mock-email-provider-service`
+
+We created a third Spring Boot service:
+
+```text
+mock-email-provider-service
+```
+
+This service represents an external or internal email-provider capability.
+
+It is NOT a new SMTP server.
+
+Spring's:
+
+```text
+JavaMailSender
+```
+
+still handles the low-level SMTP call.
+
+Our provider service adds higher-level reliability behavior:
+
+```text
+HTTP API
+Idempotency-Key contract
+duplicate-request protection
+request state
+provider response semantics
+audit/status persistence
+```
+
+Mental model:
+
+```text
+Application business service
+        ↓
+stable email capability
+        ↓
+actual SMTP/provider infrastructure
+```
+
+This is closer to an internal platform/service abstraction than simply calling `JavaMailSender` from every business service.
+
+---
+
+# 74. Staff-Level Architecture Lesson
+
+The useful engineering work is NOT merely wrapping:
+
+```java
+mailSender.send(...)
+```
+
+inside another class.
+
+The valuable part is defining a reusable contract such as:
+
+```text
+"If the caller retries the same logical request
+with the same Idempotency-Key,
+the provider should not intentionally perform
+the email side effect twice."
+```
+
+A reusable email capability may later own:
+
+```text
+idempotency
+templates
+provider adapters
+retry policy
+rate limiting
+audit history
+metrics
+tracing
+fallback provider selection
+```
+
+But we only add these when the POC exposes a problem that requires them.
+
+---
+
+# 75. Provider-Owned Database State
+
+The new provider owns its own schema:
+
+```text
+order_db
+├── order_event
+├── order_notification
+└── email_provider
+```
+
+Provider table:
+
+```text
+email_provider.email_requests
+```
+
+Important fields:
+
+```text
+idempotency_key
+order_id
+customer_id
+product_id
+quantity
+status
+created_at
+sent_at
+```
+
+The key design decision is:
+
+```text
+idempotency_key
+```
+
+is unique / the row identity.
+
+So:
+
+```text
+same Idempotency-Key
+```
+
+cannot create multiple provider request rows.
+
+---
+
+# 76. Provider Request Status
+
+We introduced provider states:
+
+```text
+PROCESSING
+SUCCESS
+FAILED
+```
+
+Current basic lifecycle:
+
+```text
+new Idempotency-Key
+        ↓
+PROCESSING
+        ↓
+send email
+        ↓
+SUCCESS
+```
+
+`sent_at` is populated after successful email delivery logic.
+
+This status is independent from the notification service's Inbox status.
+
+We now have TWO ownership domains:
+
+```text
+order_notification.inbox_events
+→ state of Kafka event processing
+
+email_provider.email_requests
+→ state of email-provider operation
+```
+
+---
+
+# 77. Atomic Provider Claim
+
+We intentionally did NOT use:
+
+```text
+exists(idempotencyKey)?
+    ↓
+if false
+    ↓
+insert
+```
+
+because we already proved that check-then-act has a concurrency race.
+
+Instead the provider uses the same atomic PostgreSQL idea:
+
+```sql
+INSERT INTO email_provider.email_requests
+    (
+        idempotency_key,
+        order_id,
+        customer_id,
+        product_id,
+        quantity,
+        status,
+        created_at
+    )
+VALUES
+    (
+        :idempotencyKey,
+        :orderId,
+        :customerId,
+        :productId,
+        :quantity,
+        'PROCESSING',
+        NOW()
+    )
+ON CONFLICT (idempotency_key) DO NOTHING;
+```
+
+Pseudo-code:
+
+```text
+rows = atomic INSERT
+
+if rows == 1:
+    I own this provider operation
+
+if rows == 0:
+    same Idempotency-Key already exists
+```
+
+---
+
+# 78. Dry Run — Two Provider Requests with Same Key
+
+Suppose:
+
+```text
+Idempotency-Key = ABC
+```
+
+Two HTTP requests arrive almost together.
+
+Provider database initially has:
+
+```text
+no ABC row
+```
+
+Request A:
+
+```text
+INSERT ABC
+    ↓
+success
+    ↓
+affected rows = 1
+    ↓
+CLAIMED
+```
+
+Request B:
+
+```text
+INSERT ABC
+    ↓
+conflict
+    ↓
+DO NOTHING
+    ↓
+affected rows = 0
+```
+
+So only Request A owns the operation.
+
+This prevents:
+
+```text
+two simultaneous HTTP calls
+→ two SMTP sends
+```
+
+from the normal concurrent-request race.
+
+---
+
+# 79. Provider HTTP API
+
+Provider endpoint:
+
+```http
+POST /api/emails/order-placed
+```
+
+Example request body:
+
+```json
+{
+  "orderId": 18,
+  "customerId": 107,
+  "productId": 7777,
+  "quantity": 1
+}
+```
+
+Important header:
+
+```http
+Idempotency-Key: 460d4f18-b702-4554-bee5-57cebff79d0c
+```
+
+The body describes:
+
+```text
+what email operation to perform
+```
+
+The header identifies:
+
+```text
+which exact logical operation this is
+```
+
+---
+
+# 80. Why the Idempotency Key Is a Header
+
+The idempotency key is request-control metadata rather than normal order business data.
+
+Conceptually:
+
+```text
+Body:
+"What should be done?"
+
+Header:
+"Which logical request is this?"
+```
+
+The provider controller reads it using:
+
+```java
+@RequestHeader("Idempotency-Key")
+UUID idempotencyKey
+```
+
+The notification service sends:
+
+```java
+.header(
+    "Idempotency-Key",
+    event.eventId().toString()
+)
+```
+
+So the same Kafka `eventId` crosses the HTTP boundary.
+
+---
+
+# 81. Provider Result Model
+
+We improved the provider so an existing key is not simply called:
+
+```text
+DUPLICATE
+```
+
+because an existing request may be in different states.
+
+We introduced:
+
+```java
+public enum EmailClaimResult {
+    CLAIMED,
+    ALREADY_SUCCESS,
+    IN_PROGRESS
+}
+```
+
+Meaning:
+
+```text
+CLAIMED
+= this HTTP request owns the operation
+
+ALREADY_SUCCESS
+= same Idempotency-Key already completed successfully
+
+IN_PROGRESS
+= same Idempotency-Key exists but is still PROCESSING
+```
+
+Pseudo-code:
+
+```text
+try atomic INSERT
+
+if inserted:
+    CLAIMED
+
+else:
+    read existing provider status
+
+    if SUCCESS:
+        ALREADY_SUCCESS
+
+    if PROCESSING:
+        IN_PROGRESS
+```
+
+---
+
+# 82. Why `ALREADY_SUCCESS` Is HTTP Success
+
+Suppose a client asks:
+
+```text
+"Ensure logical email operation ABC is performed."
+```
+
+But provider already has:
+
+```text
+ABC = SUCCESS
+```
+
+The desired operation already happened.
+
+So this should NOT behave like a business failure.
+
+Our provider returns conceptually:
+
+```text
+first call:
+200 SENT
+
+later same key:
+200 ALREADY_SENT
+```
+
+The caller can treat both as:
+
+```text
+desired side effect exists ✅
+```
+
+This is an important idempotent-API principle.
+
+---
+
+# 83. Why `IN_PROGRESS` Is Different
+
+If the provider row says:
+
+```text
+PROCESSING
+```
+
+we do NOT yet know whether the operation has completed.
+
+So provider can return:
+
+```text
+202 IN_PROGRESS
+```
+
+That tells the caller:
+
+```text
+the operation is not confirmed complete yet
+```
+
+The caller should not treat this the same as:
+
+```text
+ALREADY_SENT
+```
+
+---
+
+# 84. Actual Provider Email Flow
+
+For a newly claimed request:
+
+```text
+HTTP request
+    ↓
+atomic provider claim
+    ↓
+CLAIMED
+    ↓
+JavaMailSender
+    ↓
+Mailpit SMTP
+    ↓
+provider marks SUCCESS
+    ↓
+return SENT
+```
+
+For a repeated request after SUCCESS:
+
+```text
+HTTP request
+same Idempotency-Key
+    ↓
+atomic INSERT loses
+    ↓
+provider reads existing row
+    ↓
+status = SUCCESS
+    ↓
+return ALREADY_SENT
+    ↓
+DO NOT call JavaMailSender again
+```
+
+---
+
+# 85. Provider Request Was Tested Directly
+
+Before connecting Kafka, we tested the provider endpoint directly with the same fixed Idempotency-Key multiple times.
+
+Expected/verified behavior:
+
+```text
+first request
+→ SENT
+→ one Mailpit email
+
+same request again
+→ ALREADY_SENT
+→ no second Mailpit email
+```
+
+Provider database contains one row:
+
+```text
+same idempotency_key
+status = SUCCESS
+sent_at populated
+```
+
+This proved provider-level duplicate HTTP calls can be made safe after provider SUCCESS is recorded.
+
+---
+
+# 86. Connecting `order-notification-service` to the Provider
+
+Previously:
+
+```text
+order-notification-service
+        ↓
+JavaMailSender
+        ↓
+Mailpit
+```
+
+We changed it to:
+
+```text
+order-notification-service
+        ↓
+EmailProviderClient
+        ↓ HTTP
+mock-email-provider-service
+        ↓
+JavaMailSender
+        ↓
+Mailpit
+```
+
+The notification service no longer needs to own the final email-send decision.
+
+---
+
+# 87. Notification-Side HTTP Client
+
+The notification service creates a provider request from `OrderPlacedEvent`.
+
+Pseudo-code:
+
+```text
+request = {
+    orderId,
+    customerId,
+    productId,
+    quantity
+}
+
+POST /api/emails/order-placed
+
+Header:
+Idempotency-Key = event.eventId
+```
+
+Important code:
+
+```java
+emailProviderRestClient
+        .post()
+        .uri("/api/emails/order-placed")
+        .header(
+                "Idempotency-Key",
+                event.eventId().toString()
+        )
+        .body(request)
+        .retrieve();
+```
+
+The critical part is:
+
+```text
+eventId
+→ HTTP Idempotency-Key
+```
+
+Retries therefore reuse the same provider identity automatically.
+
+---
+
+# 88. Notification Service Interprets Provider Responses
+
+Simple behavior:
+
+```text
+SENT
+→ provider completed operation
+→ continue
+
+ALREADY_SENT
+→ provider already completed same operation
+→ continue
+
+IN_PROGRESS
+→ provider has not confirmed completion
+→ throw retryable exception
+```
+
+Pseudo-code:
+
+```text
+providerResult = callProvider(eventId)
+
+if SENT:
+    success
+
+if ALREADY_SENT:
+    success
+
+if IN_PROGRESS:
+    retry later
+```
+
+This makes the HTTP provider contract part of the Kafka retry flow.
+
+---
+
+# 89. Repeating the `7777` Test with Provider-Side Idempotency
+
+We repeated the important failure scenario:
+
+```text
+productId = 7777
+```
+
+Notification service intentionally does:
+
+```text
+call provider
+    ↓
+provider succeeds
+    ↓
+SIMULATED CRASH
+before notification Inbox COMPLETED
+```
+
+First attempt:
+
+```text
+Kafka event ABC
+    ↓
+notification CLAIMED
+    ↓
+HTTP provider call
+Idempotency-Key = ABC
+    ↓
+provider CLAIMED
+    ↓
+Mailpit email #1 ✅
+    ↓
+provider stores SUCCESS
+    ↓
+provider returns SENT
+    ↓
+notification service crashes ❌
+```
+
+Notification Inbox still says:
+
+```text
+PROCESSING
+```
+
+---
+
+# 90. What Happens After Kafka Retry Now?
+
+Kafka retries the same:
+
+```text
+eventId = ABC
+```
+
+Notification lease behavior still works:
+
+```text
+fresh PROCESSING
+→ BUSY
+→ retry
+
+later stale
+→ RECLAIMED
+```
+
+But after reclaim, the notification service calls the provider again using:
+
+```text
+Idempotency-Key = SAME ABC
+```
+
+Provider database already contains:
+
+```text
+ABC
+status = SUCCESS
+```
+
+So provider returns:
+
+```text
+ALREADY_SENT
+```
+
+without calling SMTP again.
+
+Then notification service can safely do:
+
+```text
+mark Inbox COMPLETED
+```
+
+---
+
+# 91. Before vs After Provider Idempotency
+
+## Before
+
+```text
+Kafka event ABC
+    ↓
+email #1
+    ↓
+notification crash
+    ↓
+retry / reclaim
+    ↓
+email #2 ❌
+```
+
+Result:
+
+```text
+1 logical event
+2 emails
+```
+
+## After
+
+```text
+Kafka event ABC
+    ↓
+provider call ABC
+    ↓
+email #1 ✅
+    ↓
+provider SUCCESS
+    ↓
+notification crash
+    ↓
+retry / reclaim
+    ↓
+provider call ABC again
+    ↓
+ALREADY_SENT
+    ↓
+NO second SMTP send ✅
+```
+
+Result:
+
+```text
+1 logical event
+multiple processing attempts
+multiple provider calls
+1 actual email
+```
+
+---
+
+# 92. End-to-End Provider Idempotency Test — Working
+
+The integrated flow was implemented and tested successfully.
+
+Current successful path:
+
+```text
+order-event-service
+    ↓
+Kafka
+    ↓
+order-notification-service
+    ↓
+Inbox CLAIMED / BUSY / RECLAIMED
+    ↓
+HTTP provider call
+Idempotency-Key = eventId
+    ↓
+mock-email-provider-service
+    ↓
+provider request state
+    ↓
+JavaMailSender
+    ↓
+Mailpit
+```
+
+The provider-side idempotency prevented the notification-service retry/reclaim from producing the second external email.
+
+This solves the duplicate-email problem at the notification-service boundary.
+
+---
+
+# 93. Important Architecture Learning — We Did NOT Make the Problem Disappear Completely
+
+This is the most important learning after the successful provider test.
+
+We moved the external-side-effect guarantee from:
+
+```text
+order-notification-service
+```
+
+to:
+
+```text
+mock-email-provider-service
+```
+
+Current provider internals are roughly:
+
+```text
+provider atomic claim
+    ↓
+status = PROCESSING
+    ↓
+SMTP send
+    ↓
+status = SUCCESS
+```
+
+Notice the familiar failure window:
+
+```text
+SMTP accepts email ✅
+        ↓
+mock provider crashes ❌
+        ↓
+SUCCESS never saved
+```
+
+The provider database may still say:
+
+```text
+PROCESSING
+```
+
+even though Mailpit/SMTP already accepted the email.
+
+So the same distributed-systems boundary now exists INSIDE the mock provider.
+
+---
+
+# 94. Question: Did We Solve the Problem or Only Move It?
+
+Answer:
+
+```text
+For order-notification-service:
+YES, the provider contract solves it.
+
+For our mock provider implementation:
+the deepest SMTP-vs-database failure window still exists.
+```
+
+This is not a useless move.
+
+It is an important ownership boundary.
+
+The notification service should not need to know how the email provider internally guarantees idempotency.
+
+Its responsibility is:
+
+```text
+send stable Idempotency-Key
+respect provider response contract
+```
+
+The provider's responsibility is:
+
+```text
+enforce that contract around the side effect it owns
+```
+
+---
+
+# 95. Real Provider Boundary vs Our Mock Provider
+
+If a real external API explicitly offers a strong idempotency contract, the client depends on that documented guarantee.
+
+Conceptually:
+
+```text
+our service
+    ↓
+Idempotency-Key = ABC
+    ↓
+real provider
+    ↓
+provider owns internal duplicate protection
+```
+
+We do not normally have access to the provider's internal database/SMTP transaction design.
+
+In our POC, however, we built the provider ourselves.
+
+That lets us inspect the problem one level deeper.
+
+This is useful because it demonstrates:
+
+> Accepting an `Idempotency-Key` header alone does NOT magically create idempotency.
+
+The provider must implement a reliable lifecycle around that key.
+
+---
+
+# 96. Current Mock Provider Weakness
+
+Suppose provider receives:
+
+```text
+Idempotency-Key = ABC
+```
+
+Current provider flow:
+
+```text
+INSERT ABC
+status = PROCESSING
+        ↓
+JavaMailSender.send()
+        ↓
+SMTP accepts email ✅
+        ↓
+CRASH before markSuccess()
+```
+
+Provider DB remains:
+
+```text
+ABC
+status = PROCESSING
+sent_at = NULL
+```
+
+If client calls ABC again, our current provider may respond:
+
+```text
+IN_PROGRESS
+```
+
+But if the original provider worker is dead, that state may never resolve.
+
+So the provider can now have its own version of:
+
+```text
+stuck PROCESSING
+```
+
+This is the next unresolved POC problem.
+
+---
+
+# 97. Important Difference from the Notification Inbox
+
+The notification service already has:
+
+```text
+lease
+stale claim
+atomic reclaim
+exponential retry
+jitter
+```
+
+The provider currently does NOT yet have an equivalent recovery lifecycle.
+
+But blindly adding provider stale-reclaim has another danger:
+
+```text
+provider SMTP send succeeded
+        ↓
+provider crashes
+        ↓
+PROCESSING becomes stale
+        ↓
+provider reclaims
+        ↓
+SMTP send again ❌
+```
+
+So simply copying the notification Inbox lease solution into the provider is NOT enough to guarantee one SMTP delivery.
+
+This is exactly the external-side-effect problem one level deeper.
+
+---
+
+# 98. Core Lesson — Idempotency Must Be Enforced Where the Side Effect Is Owned
+
+Think of the ownership chain:
+
+```text
+Kafka
+  ↓
+order-notification-service
+  ↓
+mock-email-provider-service
+  ↓
+SMTP / Mailpit
+```
+
+Each layer can make its own operation retry-safe:
+
+```text
+Kafka consumer
+→ eventId / Inbox
+
+HTTP provider call
+→ Idempotency-Key
+
+SMTP delivery
+→ depends on what guarantee the actual email infrastructure/provider can provide
+```
+
+The closer we get to the final irreversible side effect, the harder local DB-only exactly-once behavior becomes.
+
+---
+
+# 99. Exactly-Once Side Effect vs At-Least-Once Attempts
+
+Our system can safely allow:
+
+```text
+multiple Kafka deliveries
+
+multiple notification processing attempts
+
+multiple HTTP provider calls
+```
+
+as long as repeated attempts collapse into:
+
+```text
+one intended business side effect
+```
+
+The goal is not:
+
+```text
+"code executes exactly once"
+```
+
+The more practical goal is:
+
+```text
+"retries do not create unintended duplicate business effects"
+```
+
+That is idempotency.
+
+---
+
+# 100. Current End-to-End Architecture
+
+```text
+Client
+   ↓
+order-event-service
+   ↓
+PostgreSQL
+order_event.orders
+   ↓
+Kafka
+order-events
+   ↓
+order-notification-service
+   ↓
+Inbox atomic claim
+   |
+   ├── CLAIMED
+   ├── BUSY
+   ├── RECLAIMED
+   └── COMPLETED
+   ↓
+EmailProviderClient
+   ↓ HTTP
+Idempotency-Key = eventId
+   ↓
+mock-email-provider-service
+   ↓
+email_provider.email_requests
+   |
+   ├── CLAIMED
+   ├── ALREADY_SUCCESS
+   └── IN_PROGRESS
+   ↓
+JavaMailSender
+   ↓
+Mailpit SMTP
+   ↓
+Mailpit Inbox
+```
+
+---
+
+# 101. Current Responsibility Boundaries
+
+## `order-event-service`
+
+Owns:
+
+```text
+order creation
+event creation
+eventId generation
+Kafka publication
+```
+
+## `order-notification-service`
+
+Owns:
+
+```text
+Kafka consumption
+consumer Inbox
+retry / DLT
+claim lease
+stale recovery
+calling email capability
+```
+
+It should NOT decide whether SMTP already delivered a particular email.
+
+## `mock-email-provider-service`
+
+Owns:
+
+```text
+email API contract
+Idempotency-Key
+provider request state
+JavaMailSender
+SMTP interaction
+```
+
+It is now the side-effect owner.
+
+---
+
+# 102. Q&A — Why Not Keep Email Logic in the Notification Consumer?
+
+Because then every business consumer that needs email must understand:
+
+```text
+SMTP
+provider configuration
+provider retry semantics
+idempotency
+duplicate protection
+templates
+audit state
+```
+
+A provider abstraction allows clients to depend on:
+
+```text
+send this logical email operation
+using this idempotency identity
+```
+
+rather than vendor-specific implementation details.
+
+---
+
+# 103. Q&A — Does `ALREADY_SENT` Mean an Error?
+
+No.
+
+For an idempotent API:
+
+```text
+request ABC already succeeded
+```
+
+means the requested final state already exists.
+
+So:
+
+```text
+SENT
+```
+
+and:
+
+```text
+ALREADY_SENT
+```
+
+are both successful outcomes for the caller.
+
+Pseudo-code:
+
+```text
+if provider says SENT:
+    continue
+
+if provider says ALREADY_SENT:
+    continue
+
+if provider says IN_PROGRESS:
+    retry later
+```
+
+---
+
+# 104. Q&A — What Did We Actually Solve?
+
+We solved this notification-service failure:
+
+```text
+email/provider operation succeeds
+        ↓
+notification consumer crashes
+        ↓
+Kafka retries
+        ↓
+notification calls provider again
+        ↓
+provider recognizes same eventId
+        ↓
+NO duplicate provider side effect
+```
+
+At the notification boundary:
+
+```text
+✅ retry-safe
+```
+
+---
+
+# 105. Q&A — What Problem Still Exists?
+
+Inside our custom provider:
+
+```text
+provider PROCESSING
+        ↓
+SMTP succeeds
+        ↓
+provider crashes
+        ↓
+SUCCESS not written
+```
+
+So:
+
+```text
+email already exists externally
+but provider DB may not know it
+```
+
+This is the current unresolved issue.
+
+The problem has moved to the component that now OWNS the email side effect.
+
+That is architecturally correct ownership, but our mock implementation is not yet fully hardened.
+
+---
+
+# 106. Current Checkpoint
+
+Completed:
+
+```text
+✅ Reproduced crash-after-email duplicate
+
+✅ Verified stale reclaim could send duplicate email
+
+✅ Created mock-email-provider-service
+
+✅ Added provider-owned schema/table
+
+✅ Added provider Idempotency-Key
+
+✅ Added atomic provider claim
+
+✅ Added PROCESSING / SUCCESS provider state
+
+✅ Added provider HTTP endpoint
+
+✅ Added CLAIMED / ALREADY_SUCCESS / IN_PROGRESS result model
+
+✅ Added JavaMailSender behind provider
+
+✅ Tested same provider key directly
+
+✅ Same successful key does not resend email
+
+✅ Connected notification service to provider over HTTP
+
+✅ Kafka eventId is sent as Idempotency-Key
+
+✅ Notification service treats SENT as success
+
+✅ Notification service treats ALREADY_SENT as success
+
+✅ Integrated productId=7777 scenario retested
+
+✅ Notification retry/reclaim no longer creates second provider email
+
+✅ Notification Inbox eventually becomes COMPLETED
+```
+
+Current unresolved boundary:
+
+```text
+mock provider:
+SMTP succeeds
+↓
+provider crashes before SUCCESS
+↓
+provider database may remain PROCESSING
+```
+
+---
+
+# 107. Updated Roadmap
+
+```text
+1. Stable eventId                              [✅ Completed]
+2. Replay using same eventId                   [✅ Completed]
+3. Concurrent duplicate race                   [✅ Completed]
+4. Atomic consumer Inbox                       [✅ Completed]
+5. Consumer lease / stale reclaim              [✅ Completed]
+6. Exponential retry + jitter                   [✅ Completed]
+7. Crash-before-email consumer recovery        [✅ Completed]
+8. Crash-after-email duplicate reproduced      [✅ Completed]
+
+9. Mock email provider service                  [✅ Completed]
+10. Provider Idempotency-Key                    [✅ Completed]
+11. Provider atomic request claim               [✅ Completed]
+12. Provider request status model               [✅ Completed]
+13. Provider JavaMailSender integration         [✅ Completed]
+14. Notification → provider HTTP integration    [✅ Completed]
+15. Same eventId → same Idempotency-Key         [✅ Completed]
+16. Provider ALREADY_SENT behavior              [✅ Completed]
+17. End-to-end duplicate email prevention       [✅ Completed]
+
+18. Provider crash after SMTP before SUCCESS    [⏳ NEXT]
+19. Decide provider recovery boundary            [⏳ Next]
+20. FAILED / operational provider semantics      [⏳ Upcoming]
+
+21. Producer DB → Kafka failure window           [⏳ Upcoming]
+22. Transactional Outbox                         [⏳ Upcoming]
+23. Multiple partitions                          [⏳ Upcoming]
+24. Multiple consumer instances                  [⏳ Upcoming]
+25. Consumer-group rebalancing                   [⏳ Upcoming]
+26. Multi-broker / replicas / ISR                [⏳ Upcoming]
+27. OpenSearch read model                        [⏳ Upcoming]
+```
+
+---
+
+# 108. Revision Summary — How the Problem Moved
+
+The progression is important:
+
+```text
+Stage 1
+
+order-notification-service
+directly sends SMTP
+        ↓
+retry can send duplicate email
+```
+
+We added:
+
+```text
+consumer Inbox
+lease
+reclaim
+```
+
+That fixed ownership/recovery, but not external duplicate delivery.
+
+Then:
+
+```text
+Stage 2
+
+order-notification-service
+        ↓
+Idempotency-Key
+        ↓
+mock-email-provider-service
+        ↓
+SMTP
+```
+
+Now notification retries are safe because the provider remembers successful logical operations.
+
+But:
+
+```text
+Stage 3 — current edge
+
+mock-email-provider-service
+        ↓
+SMTP succeeds
+        ↓
+provider crashes before SUCCESS
+```
+
+So the final side-effect uncertainty now belongs to:
+
+```text
+the service that owns SMTP delivery
+```
+
+That is the correct architectural boundary.
+
+The next question is not:
+
+```text
+"How does Kafka fix SMTP?"
+```
+
+It is:
+
+```text
+"What guarantee should our email provider itself offer,
+and how does it recover when its own final side effect
+and its local database disagree?"
 ```
